@@ -16,10 +16,23 @@ type CommentPin = {
   resolved: boolean;
 };
 
+type RemoteCursor = {
+  clientId: number;
+  x: number;
+  y: number;
+  name: string;
+  color: string;
+};
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const PAGE_W = 850;
 const PAGE_H = 1100;
+
+const CURSOR_COLORS = [
+  "#f59e0b", "#ec4899", "#8b5cf6", "#06b6d4",
+  "#10b981", "#ef4444", "#f97316", "#84cc16",
+];
 
 // ── Speech balloon SVG path builder ──────────────────────────────────────────
 
@@ -47,6 +60,16 @@ function buildBalloonPath(w: number, h: number, tx: number, ty: number, r = 18) 
   ].join(" ");
 }
 
+// ── Debounce helper ───────────────────────────────────────────────────────────
+
+function debounce<T extends (...args: any[]) => void>(fn: T, ms: number): T {
+  let timer: ReturnType<typeof setTimeout>;
+  return ((...args: any[]) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  }) as T;
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function ComicEditorClient() {
@@ -58,15 +81,22 @@ export default function ComicEditorClient() {
   const [commentText, setCommentText] = useState("");
   const [showComments, setShowComments] = useState(true);
   const [zoom, setZoom] = useState(1);
+  const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
+  const [syncStatus, setSyncStatus] = useState<"offline" | "connecting" | "live">("offline");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeToolRef = useRef<Tool>("select");
+  const isRemoteUpdateRef = useRef(false);
 
   useEffect(() => { activeToolRef.current = activeTool; }, [activeTool]);
 
-  // ── Init Fabric canvas ──────────────────────────────────────────────────────
+  // ── Init Fabric canvas + Yjs sync ──────────────────────────────────────────
   useEffect(() => {
     if (!canvasRef.current) return;
-    import("fabric").then(({ fabric }) => {
+
+    let cleanup: (() => void) | undefined;
+
+    import("fabric").then(async ({ fabric }) => {
+      // ── Canvas setup ──────────────────────────────────────────────────────
       const canvas = new fabric.Canvas(canvasRef.current!, {
         width: PAGE_W,
         height: PAGE_H,
@@ -84,25 +114,17 @@ export default function ComicEditorClient() {
       canvas.add(border);
       canvas.sendToBack(border);
 
+      // ── Tool-based mouse handler ──────────────────────────────────────────
       canvas.on("mouse:down", (opt: any) => {
         const tool = activeToolRef.current;
         const pointer = canvas.getPointer(opt.e);
-
-        if (tool === "panel") {
-          addPanel(canvas, fabric, pointer.x, pointer.y);
-          setActiveTool("select");
-        } else if (tool === "textbox") {
-          addTextBox(canvas, fabric, pointer.x, pointer.y);
-          setActiveTool("select");
-        } else if (tool === "balloon") {
-          addSpeechBalloon(canvas, fabric, pointer.x, pointer.y);
-          setActiveTool("select");
-        } else if (tool === "comment") {
-          setCommentDraft({ x: pointer.x, y: pointer.y });
-          setActiveTool("select");
-        }
+        if (tool === "panel") { addPanel(canvas, fabric, pointer.x, pointer.y); setActiveTool("select"); }
+        else if (tool === "textbox") { addTextBox(canvas, fabric, pointer.x, pointer.y); setActiveTool("select"); }
+        else if (tool === "balloon") { addSpeechBalloon(canvas, fabric, pointer.x, pointer.y); setActiveTool("select"); }
+        else if (tool === "comment") { setCommentDraft({ x: pointer.x, y: pointer.y }); setActiveTool("select"); }
       });
 
+      // ── Clipboard paste ───────────────────────────────────────────────────
       const handlePaste = (e: ClipboardEvent) => {
         const items = e.clipboardData?.items;
         if (!items) return;
@@ -116,19 +138,112 @@ export default function ComicEditorClient() {
       };
       window.addEventListener("paste", handlePaste);
 
-      return () => {
-        canvas.dispose();
-        window.removeEventListener("paste", handlePaste);
-      };
+      // ── Yjs sync (only when NEXT_PUBLIC_PARTYKIT_HOST is set) ─────────────
+      const partykitHost = process.env.NEXT_PUBLIC_PARTYKIT_HOST;
+      const roomId = typeof window !== "undefined"
+        ? (new URLSearchParams(window.location.search).get("room") || "default")
+        : "default";
+
+      if (partykitHost) {
+        setSyncStatus("connecting");
+
+        const [Y, { default: YPartyKitProvider }] = await Promise.all([
+          import("yjs"),
+          import("y-partykit/provider"),
+        ]);
+
+        const doc = new Y.Doc();
+        const yCanvas = doc.getMap<string>("canvas");
+        const yComments = doc.getArray<CommentPin>("comments");
+
+        const provider = new YPartyKitProvider(partykitHost, roomId, doc, {
+          connect: true,
+        });
+
+        provider.on("status", ({ status }: { status: string }) => {
+          setSyncStatus(status === "connected" ? "live" : "connecting");
+        });
+
+        // Assign a random color and name to this user's cursor
+        const myColor = CURSOR_COLORS[Math.floor(Math.random() * CURSOR_COLORS.length)];
+        const myName = `User-${Math.random().toString(36).slice(2, 6)}`;
+        provider.awareness.setLocalStateField("user", { name: myName, color: myColor });
+
+        // Broadcast cursor position
+        canvas.on("mouse:move", (opt: any) => {
+          const pointer = canvas.getPointer(opt.e);
+          provider.awareness.setLocalStateField("cursor", pointer);
+        });
+
+        // Render remote cursors
+        provider.awareness.on("change", () => {
+          const states = provider.awareness.getStates();
+          const cursors: RemoteCursor[] = [];
+          states.forEach((state: any, clientId: number) => {
+            if (clientId === provider.awareness.clientID) return;
+            if (state.cursor && state.user) {
+              cursors.push({ clientId, x: state.cursor.x, y: state.cursor.y, name: state.user.name, color: state.user.color });
+            }
+          });
+          setRemoteCursors(cursors);
+        });
+
+        // Canvas → Yjs (debounced, skip if this was a remote update)
+        const pushToYjs = debounce(() => {
+          if (isRemoteUpdateRef.current) return;
+          const json = JSON.stringify(canvas.toJSON(["data"]));
+          doc.transact(() => { yCanvas.set("json", json); });
+        }, 400);
+
+        canvas.on("object:added", pushToYjs);
+        canvas.on("object:modified", pushToYjs);
+        canvas.on("object:removed", pushToYjs);
+
+        // Yjs → Canvas
+        yCanvas.observe((event) => {
+          if (event.transaction.local) return; // ignore our own changes
+          const json = yCanvas.get("json");
+          if (!json) return;
+          isRemoteUpdateRef.current = true;
+          canvas.loadFromJSON(json, () => {
+            canvas.renderAll();
+            isRemoteUpdateRef.current = false;
+          });
+        });
+
+        // Comments sync: Yjs array → React state
+        yComments.observe(() => {
+          setComments(yComments.toArray());
+        });
+
+        // Override comment setter to write through Yjs
+        (window as any).__yComments = yComments;
+
+        cleanup = () => {
+          provider.destroy();
+          doc.destroy();
+          canvas.dispose();
+          window.removeEventListener("paste", handlePaste);
+        };
+      } else {
+        // No PartyKit host — local-only mode
+        cleanup = () => {
+          canvas.dispose();
+          window.removeEventListener("paste", handlePaste);
+        };
+      }
     });
+
+    return () => cleanup?.();
   }, []);
+
+  // ── Canvas helpers ─────────────────────────────────────────────────────────
 
   function addPanel(canvas: any, fabric: any, x: number, y: number) {
     const rect = new fabric.Rect({
       left: x, top: y, width: 200, height: 160,
       fill: "#ffffff", stroke: "#1e293b", strokeWidth: 3,
-      rx: 2, ry: 2,
-      data: { type: "panel" },
+      rx: 2, ry: 2, data: { type: "panel" },
     });
     canvas.add(rect);
     canvas.setActiveObject(rect);
@@ -137,13 +252,10 @@ export default function ComicEditorClient() {
 
   function addTextBox(canvas: any, fabric: any, x: number, y: number) {
     const tb = new fabric.Textbox("Type here...", {
-      left: x, top: y, width: 180,
-      fontSize: 16,
-      fontFamily: "Bangers, cursive",
-      fill: "#0f172a",
+      left: x, top: y, width: 180, fontSize: 16,
+      fontFamily: "Bangers, cursive", fill: "#0f172a",
       backgroundColor: "rgba(255,255,255,0.85)",
-      borderColor: "#3b82f6",
-      padding: 6,
+      borderColor: "#3b82f6", padding: 6,
       data: { type: "textbox" },
     });
     canvas.add(tb);
@@ -158,25 +270,17 @@ export default function ComicEditorClient() {
     const tailTipY = bh + 50;
 
     const balloon = new fabric.Path(buildBalloonPath(bw, bh, tailTipX, tailTipY), {
-      left: x, top: y,
-      fill: "#ffffff", stroke: "#0f172a", strokeWidth: 2.5,
+      left: x, top: y, fill: "#ffffff", stroke: "#0f172a", strokeWidth: 2.5,
       data: { type: "balloon", tailTipX, tailTipY, bw, bh },
     });
-
     const text = new fabric.Textbox("...", {
-      left: x + 12, top: y + 12,
-      width: bw - 24,
-      fontSize: 15,
-      fontFamily: "Bangers, cursive",
-      fill: "#0f172a",
-      textAlign: "center",
+      left: x + 12, top: y + 12, width: bw - 24, fontSize: 15,
+      fontFamily: "Bangers, cursive", fill: "#0f172a", textAlign: "center",
       data: { type: "balloon-text" },
     });
-
     const handle = new fabric.Circle({
       left: x + tailTipX - 6, top: y + tailTipY - 6,
-      radius: 6,
-      fill: "#3b82f6", stroke: "#1d4ed8", strokeWidth: 1.5,
+      radius: 6, fill: "#3b82f6", stroke: "#1d4ed8", strokeWidth: 1.5,
       hasControls: false, hasBorders: false,
       data: { type: "balloon-handle", bw, bh },
     });
@@ -188,12 +292,10 @@ export default function ComicEditorClient() {
       balloon.setCoords();
       canvas.renderAll();
     });
-
     balloon.on("moving", () => {
       handle.set({ left: balloon.left! + tailTipX - 6, top: balloon.top! + tailTipY - 6 });
       text.set({ left: balloon.left! + 12, top: balloon.top! + 12 });
-      handle.setCoords();
-      text.setCoords();
+      handle.setCoords(); text.setCoords();
       canvas.renderAll();
     });
 
@@ -222,20 +324,39 @@ export default function ComicEditorClient() {
     e.target.value = "";
   }, []);
 
+  // ── Comments (write through Yjs when live, local otherwise) ───────────────
   function submitComment() {
     if (!commentDraft || !commentText.trim()) return;
-    setComments(prev => [...prev, {
-      id: crypto.randomUUID(),
-      x: commentDraft.x, y: commentDraft.y,
-      text: commentText.trim(),
-      author: "You",
-      createdAt: Date.now(),
-      resolved: false,
-    }]);
+    const pin: CommentPin = {
+      id: crypto.randomUUID(), x: commentDraft.x, y: commentDraft.y,
+      text: commentText.trim(), author: "You",
+      createdAt: Date.now(), resolved: false,
+    };
+    const yComments = (window as any).__yComments;
+    if (yComments) {
+      yComments.push([pin]); // Yjs observer will update React state
+    } else {
+      setComments(prev => [...prev, pin]);
+    }
     setCommentDraft(null);
     setCommentText("");
   }
 
+  function resolveComment(id: string) {
+    const yComments = (window as any).__yComments;
+    if (yComments) {
+      const idx = (yComments.toArray() as CommentPin[]).findIndex(c => c.id === id);
+      if (idx !== -1) {
+        const pin = yComments.get(idx) as CommentPin;
+        yComments.delete(idx, 1);
+        yComments.insert(idx, [{ ...pin, resolved: true }]);
+      }
+    } else {
+      setComments(prev => prev.map(c => c.id === id ? { ...c, resolved: true } : c));
+    }
+  }
+
+  // ── Zoom / delete ──────────────────────────────────────────────────────────
   function handleZoom(factor: number) {
     const canvas = fabricRef.current;
     if (!canvas) return;
@@ -256,7 +377,7 @@ export default function ComicEditorClient() {
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if ((e.key === "Delete" || e.key === "Backspace")) {
+      if (e.key === "Delete" || e.key === "Backspace") {
         const tag = (document.activeElement as HTMLElement)?.tagName;
         if (tag === "INPUT" || tag === "TEXTAREA") return;
         deleteSelected();
@@ -272,6 +393,10 @@ export default function ComicEditorClient() {
     balloon: "crosshair", image: "default", comment: "cell",
   };
 
+  const syncDot = syncStatus === "live" ? "#10b981" : syncStatus === "connecting" ? "#f59e0b" : "#64748b";
+  const syncLabel = syncStatus === "live" ? "Live" : syncStatus === "connecting" ? "Connecting…" : "Local";
+
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <>
       {/* eslint-disable-next-line @next/next/no-page-custom-font */}
@@ -284,7 +409,16 @@ export default function ComicEditorClient() {
         <header style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 16px", background: "#1e293b", borderBottom: "1px solid #334155", flexShrink: 0 }}>
           <span style={{ fontFamily: "Bangers, cursive", fontSize: 22, letterSpacing: 2, color: "#3b82f6" }}>COMIC FORGE</span>
           <div style={{ flex: 1 }} />
-          <span style={{ fontSize: 12, color: "#64748b" }}>Add <code>NEXT_PUBLIC_LIVEBLOCKS_PUBLIC_KEY</code> to .env.local for live sync</span>
+
+          {/* Sync indicator */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+            <span style={{ width: 8, height: 8, borderRadius: "50%", background: syncDot, display: "inline-block", boxShadow: syncStatus === "live" ? `0 0 6px ${syncDot}` : "none" }} />
+            <span style={{ color: syncDot }}>{syncLabel}</span>
+            {syncStatus === "offline" && (
+              <span style={{ color: "#475569", fontSize: 11 }}>— set <code>NEXT_PUBLIC_PARTYKIT_HOST</code> to enable sync</span>
+            )}
+          </div>
+
           <button onClick={() => setShowComments(v => !v)} style={btnStyle(showComments ? "#059669" : "#334155")}>
             💬 Comments{comments.filter(c => !c.resolved).length > 0 ? ` (${comments.filter(c => !c.resolved).length})` : ""}
           </button>
@@ -318,12 +452,22 @@ export default function ComicEditorClient() {
             <div style={{ position: "relative", boxShadow: "0 8px 40px rgba(0,0,0,0.6)", cursor: toolCursor[activeTool] }}>
               <canvas ref={canvasRef} />
 
-              {showComments && comments.map(pin => (
-                <CommentPinMarker key={pin.id} pin={pin} zoom={zoom}
-                  onResolve={() => setComments(prev => prev.map(c => c.id === pin.id ? { ...c, resolved: true } : c))}
-                />
+              {/* Remote cursors */}
+              {remoteCursors.map(cursor => (
+                <div key={cursor.clientId} style={{ position: "absolute", left: cursor.x * zoom - 6, top: cursor.y * zoom - 6, pointerEvents: "none", zIndex: 80 }}>
+                  <div style={{ width: 12, height: 12, borderRadius: "50% 0 50% 50%", background: cursor.color, transform: "rotate(-45deg)", boxShadow: `0 0 6px ${cursor.color}` }} />
+                  <span style={{ position: "absolute", left: 14, top: -2, background: cursor.color, color: "#fff", fontSize: 10, padding: "1px 5px", borderRadius: 4, whiteSpace: "nowrap" }}>
+                    {cursor.name}
+                  </span>
+                </div>
               ))}
 
+              {/* Comment pins */}
+              {showComments && comments.map(pin => (
+                <CommentPinMarker key={pin.id} pin={pin} zoom={zoom} onResolve={() => resolveComment(pin.id)} />
+              ))}
+
+              {/* Comment draft input */}
               {commentDraft && (
                 <div style={{ position: "absolute", left: commentDraft.x * zoom, top: commentDraft.y * zoom, background: "#1e293b", border: "1px solid #3b82f6", borderRadius: 8, padding: 10, zIndex: 100, display: "flex", flexDirection: "column", gap: 6, minWidth: 200 }}>
                   <textarea autoFocus value={commentText} onChange={e => setCommentText(e.target.value)}
@@ -355,8 +499,7 @@ export default function ComicEditorClient() {
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
                       <span style={{ fontSize: 11, color: "#10b981", fontWeight: 700 }}>{pin.author}</span>
                       {!pin.resolved && (
-                        <button onClick={() => setComments(prev => prev.map(c => c.id === pin.id ? { ...c, resolved: true } : c))}
-                          style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 11, padding: 0 }}>✓ Resolve</button>
+                        <button onClick={() => resolveComment(pin.id)} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 11, padding: 0 }}>✓ Resolve</button>
                       )}
                     </div>
                     <p style={{ margin: 0, fontSize: 13, color: "#e2e8f0", lineHeight: 1.4 }}>{pin.text}</p>
@@ -381,6 +524,8 @@ export default function ComicEditorClient() {
     </>
   );
 }
+
+// ── Comment pin marker ─────────────────────────────────────────────────────
 
 function CommentPinMarker({ pin, zoom, onResolve }: { pin: CommentPin; zoom: number; onResolve: () => void }) {
   const [open, setOpen] = useState(false);

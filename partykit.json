@@ -1,0 +1,4 @@
+{
+  "name": "comic-forge",
+  "main": "party/index.ts"
+}
