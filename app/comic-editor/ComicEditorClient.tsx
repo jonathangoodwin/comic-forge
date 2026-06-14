@@ -89,6 +89,8 @@ export default function ComicEditorClient() {
   const historyRef = useRef<string[]>([]);
   const historyIndexRef = useRef<number>(-1);
   const isHistoryUpdateRef = useRef(false);
+  const [selectedText, setSelectedText] = useState<string | null>(null);
+  const selectedObjectRef = useRef<any>(null);
 
   useEffect(() => { activeToolRef.current = activeTool; }, [activeTool]);
 
@@ -167,6 +169,27 @@ export default function ComicEditorClient() {
       canvas.on("object:added", saveToHistory);
       canvas.on("object:modified", saveToHistory);
       canvas.on("object:removed", saveToHistory);
+
+      // ── Selection → properties sidebar ───────────────────────────────────
+      const syncSidebar = () => {
+        const obj = canvas.getActiveObject();
+        if (obj?.type === "textbox") {
+          selectedObjectRef.current = obj;
+          setSelectedText(obj.text ?? "");
+        } else {
+          selectedObjectRef.current = null;
+          setSelectedText(null);
+        }
+      };
+      canvas.on("selection:created", syncSidebar);
+      canvas.on("selection:updated", syncSidebar);
+      canvas.on("selection:cleared", syncSidebar);
+      // Keep sidebar in sync when editing text directly on canvas
+      canvas.on("text:changed", (opt: any) => {
+        if (opt.target === selectedObjectRef.current) {
+          setSelectedText(opt.target.text ?? "");
+        }
+      });
 
       // ── Clipboard paste ───────────────────────────────────────────────────
       const handlePaste = (e: ClipboardEvent) => {
@@ -400,6 +423,17 @@ export default function ComicEditorClient() {
     }
   }
 
+  // ── Properties sidebar ────────────────────────────────────────────────────
+  function handleSidebarTextChange(value: string) {
+    const canvas = fabricRef.current;
+    const obj = selectedObjectRef.current;
+    if (!obj || !canvas) return;
+    setSelectedText(value);
+    obj.set("text", value);
+    canvas.renderAll();
+    canvas.fire("object:modified", { target: obj });
+  }
+
   // ── Zoom / delete ──────────────────────────────────────────────────────────
   function handleZoom(factor: number) {
     const canvas = fabricRef.current;
@@ -542,6 +576,22 @@ export default function ComicEditorClient() {
               )}
             </div>
           </main>
+
+          {/* Properties panel */}
+          {selectedText !== null && (
+            <aside style={{ width: 220, background: "#1e293b", borderLeft: "1px solid #334155", display: "flex", flexDirection: "column", flexShrink: 0 }}>
+              <div style={{ padding: "12px 16px", borderBottom: "1px solid #334155", fontFamily: "Bangers, cursive", fontSize: 16, letterSpacing: 1, color: "#3b82f6" }}>PROPERTIES</div>
+              <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                <label style={{ fontSize: 11, color: "#64748b", textTransform: "uppercase", letterSpacing: 1 }}>Text</label>
+                <textarea
+                  value={selectedText}
+                  onChange={e => handleSidebarTextChange(e.target.value)}
+                  rows={5}
+                  style={{ background: "#0f172a", border: "1px solid #475569", color: "#e2e8f0", borderRadius: 4, padding: 8, fontSize: 14, resize: "vertical", outline: "none", fontFamily: "Bangers, cursive", lineHeight: 1.4 }}
+                />
+              </div>
+            </aside>
+          )}
 
           {/* Comments panel */}
           {showComments && (
