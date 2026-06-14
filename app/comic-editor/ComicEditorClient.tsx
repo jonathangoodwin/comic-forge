@@ -124,6 +124,33 @@ export default function ComicEditorClient() {
         else if (tool === "comment") { setCommentDraft({ x: pointer.x, y: pointer.y }); setActiveTool("select"); }
       });
 
+      // ── Double-click to edit text objects ─────────────────────────────────
+      canvas.on("mouse:dblclick", (opt: any) => {
+        const target = opt.target;
+        if (!target) return;
+        if (target.type === "textbox") {
+          canvas.setActiveObject(target);
+          target.enterEditing();
+          canvas.renderAll();
+          return;
+        }
+        // Clicking on the balloon shape itself should open its companion text for editing
+        if (target.data?.type === "balloon") {
+          const bLeft = target.left;
+          const bTop = target.top;
+          const companion = canvas.getObjects().find((obj: any) =>
+            obj.data?.type === "balloon-text" &&
+            Math.abs(obj.left - (bLeft + 12)) < 2 &&
+            Math.abs(obj.top - (bTop + 12)) < 2
+          );
+          if (companion) {
+            canvas.setActiveObject(companion);
+            companion.enterEditing();
+            canvas.renderAll();
+          }
+        }
+      });
+
       // ── Clipboard paste ───────────────────────────────────────────────────
       const handlePaste = (e: ClipboardEvent) => {
         const items = e.clipboardData?.items;
