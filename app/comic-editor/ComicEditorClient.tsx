@@ -86,6 +86,9 @@ export default function ComicEditorClient() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeToolRef = useRef<Tool>("select");
   const isRemoteUpdateRef = useRef(false);
+  const historyRef = useRef<string[]>([]);
+  const historyIndexRef = useRef<number>(-1);
+  const isHistoryUpdateRef = useRef(false);
 
   useEffect(() => { activeToolRef.current = activeTool; }, [activeTool]);
 
@@ -150,6 +153,20 @@ export default function ComicEditorClient() {
           }
         }
       });
+
+      // ── Undo history ─────────────────────────────────────────────────────
+      // Debounced so multi-object additions (balloon = 3 objects) become one entry
+      const saveToHistory = debounce(() => {
+        if (isHistoryUpdateRef.current || isRemoteUpdateRef.current) return;
+        const json = JSON.stringify(canvas.toJSON(["data"]));
+        historyRef.current = historyRef.current.slice(0, historyIndexRef.current + 1);
+        historyRef.current.push(json);
+        historyIndexRef.current = historyRef.current.length - 1;
+      }, 100);
+
+      canvas.on("object:added", saveToHistory);
+      canvas.on("object:modified", saveToHistory);
+      canvas.on("object:removed", saveToHistory);
 
       // ── Clipboard paste ───────────────────────────────────────────────────
       const handlePaste = (e: ClipboardEvent) => {
@@ -402,14 +419,29 @@ export default function ComicEditorClient() {
     canvas.renderAll();
   }
 
+  function undo() {
+    const canvas = fabricRef.current;
+    if (!canvas || historyIndexRef.current <= 0) return;
+    historyIndexRef.current--;
+    isHistoryUpdateRef.current = true;
+    canvas.loadFromJSON(historyRef.current[historyIndexRef.current], () => {
+      canvas.renderAll();
+      isHistoryUpdateRef.current = false;
+    });
+  }
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
+      const tag = (document.activeElement as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
       if (e.key === "Delete" || e.key === "Backspace") {
-        const tag = (document.activeElement as HTMLElement)?.tagName;
-        if (tag === "INPUT" || tag === "TEXTAREA") return;
         deleteSelected();
       }
       if (e.key === "Escape") setActiveTool("select");
+      if ((e.ctrlKey || e.metaKey) && e.key === "z") {
+        e.preventDefault();
+        undo();
+      }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
