@@ -173,21 +173,35 @@ export default function ComicEditorClient() {
       // ── Selection → properties sidebar ───────────────────────────────────
       const syncSidebar = () => {
         const obj = canvas.getActiveObject();
-        if (obj?.type === "textbox") {
+        if (!obj) { selectedObjectRef.current = null; setSelectedText(null); return; }
+
+        if (obj.type === "textbox") {
           selectedObjectRef.current = obj;
-          setSelectedText(obj.text ?? "");
-        } else {
-          selectedObjectRef.current = null;
-          setSelectedText(null);
+          setSelectedText(String(obj.text ?? ""));
+          return;
         }
+        // Clicking the balloon shape: find its companion text object
+        if (obj.data?.type === "balloon") {
+          const companion = canvas.getObjects().find((o: any) =>
+            o.data?.type === "balloon-text" &&
+            Math.abs(o.left - (obj.left + 12)) < 4 &&
+            Math.abs(o.top - (obj.top + 12)) < 4
+          );
+          if (companion) {
+            selectedObjectRef.current = companion;
+            setSelectedText(String(companion.text ?? ""));
+            return;
+          }
+        }
+        selectedObjectRef.current = null;
+        setSelectedText(null);
       };
       canvas.on("selection:created", syncSidebar);
       canvas.on("selection:updated", syncSidebar);
       canvas.on("selection:cleared", syncSidebar);
-      // Keep sidebar in sync when editing text directly on canvas
       canvas.on("text:changed", (opt: any) => {
         if (opt.target === selectedObjectRef.current) {
-          setSelectedText(opt.target.text ?? "");
+          setSelectedText(String(opt.target.text ?? ""));
         }
       });
 
@@ -577,21 +591,27 @@ export default function ComicEditorClient() {
             </div>
           </main>
 
-          {/* Properties panel */}
-          {selectedText !== null && (
-            <aside style={{ width: 220, background: "#1e293b", borderLeft: "1px solid #334155", display: "flex", flexDirection: "column", flexShrink: 0 }}>
-              <div style={{ padding: "12px 16px", borderBottom: "1px solid #334155", fontFamily: "Bangers, cursive", fontSize: 16, letterSpacing: 1, color: "#3b82f6" }}>PROPERTIES</div>
-              <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 6 }}>
-                <label style={{ fontSize: 11, color: "#64748b", textTransform: "uppercase", letterSpacing: 1 }}>Text</label>
-                <textarea
-                  value={selectedText}
-                  onChange={e => handleSidebarTextChange(e.target.value)}
-                  rows={5}
-                  style={{ background: "#0f172a", border: "1px solid #475569", color: "#e2e8f0", borderRadius: 4, padding: 8, fontSize: 14, resize: "vertical", outline: "none", fontFamily: "Bangers, cursive", lineHeight: 1.4 }}
-                />
-              </div>
-            </aside>
-          )}
+          {/* Properties panel — always visible */}
+          <aside style={{ width: 220, background: "#1e293b", borderLeft: "1px solid #334155", display: "flex", flexDirection: "column", flexShrink: 0 }}>
+            <div style={{ padding: "12px 16px", borderBottom: "1px solid #334155", fontFamily: "Bangers, cursive", fontSize: 16, letterSpacing: 1, color: "#3b82f6" }}>PROPERTIES</div>
+            <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+              {selectedText === null ? (
+                <p style={{ color: "#475569", fontSize: 12, margin: 0, lineHeight: 1.5 }}>
+                  Select a text box or speech bubble to edit its text here.
+                </p>
+              ) : (
+                <>
+                  <label style={{ fontSize: 11, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 1 }}>Text content</label>
+                  <textarea
+                    value={selectedText}
+                    onChange={e => handleSidebarTextChange(e.target.value)}
+                    rows={6}
+                    style={{ background: "#0f172a", border: "2px solid #3b82f6", color: "#f1f5f9", borderRadius: 6, padding: 10, fontSize: 15, resize: "vertical", outline: "none", fontFamily: "Bangers, cursive", lineHeight: 1.5, width: "100%", boxSizing: "border-box" }}
+                  />
+                </>
+              )}
+            </div>
+          </aside>
 
           {/* Comments panel */}
           {showComments && (
