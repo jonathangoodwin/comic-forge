@@ -1,17 +1,18 @@
 "use client";
 
-import React, { useRef, useState, useCallback, useEffect } from "react";
+import React, { useRef, useState, useCallback, useEffect, useLayoutEffect } from "react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type Tool = "select" | "pan" | "frame" | "text" | "balloon" | "narration" | "comment";
 
 type FrameObj     = { id: string; kind: "frame";     x: number; y: number; w: number; h: number; imageUrl?: string };
-type TextObj      = { id: string; kind: "text";      x: number; y: number; w: number; h: number; content: string; fontSize: number; textColor?: string; bgColor?: string; fontFamily?: string };
+type TextObj      = { id: string; kind: "text";      x: number; y: number; w: number; h: number; content: string; fontSize?: number; textColor?: string; bgColor?: string; fontFamily?: string };
 type BalloonObj   = {
   id: string; kind: "balloon";
   x: number; y: number; w: number; h: number;
   content: string;
+  fontSize?: number;
   stemDx: number; stemDy: number;   // stem tip offset from ellipse center
   stemTargetId?: string;             // if set, stem tip snaps to edge of this balloon
   stemBend: number;                  // lateral bend of stem sides (0 = straight)
@@ -19,7 +20,7 @@ type BalloonObj   = {
   mergedPairId?: string;             // if set, rendered as compound shape with this balloon
   textColor?: string; bgColor?: string; borderColor?: string; fontFamily?: string;
 };
-type NarrationObj = { id: string; kind: "narration"; x: number; y: number; w: number; h: number; content: string; fontSize: number; bgColor: string; textColor: string; borderColor?: string; fontFamily?: string };
+type NarrationObj = { id: string; kind: "narration"; x: number; y: number; w: number; h: number; content: string; fontSize?: number; bgColor: string; textColor: string; borderColor?: string; fontFamily?: string };
 type PageObj = FrameObj | TextObj | BalloonObj | NarrationObj;
 
 type Page = { id: string; objects: PageObj[] };
@@ -30,6 +31,8 @@ type AssetItem  = { id: string; name: string; url: string; thumb: string };
 
 const STEM_DELTA_ON_TARGET = 0.13; // arc half-width on target where stem merges (slightly wider than stem base)
 const STEM_CONNECT_TIP_DELTA = 0.045; // half-width of stem tip where it enters a connected balloon
+
+const FONT_SIZES = [10, 12, 14, 16, 18, 20, 24, 28, 32, 40, 48];
 
 const FONTS: { label: string; value: string }[] = [
   { label: "Bangers",         value: "Bangers, cursive" },
@@ -59,6 +62,32 @@ export default function ComicEditorClient() {
   const [zoom, setZoom] = useState(0.8);
   const zoomRef = useRef(0.8);
   const mainRef = useRef<HTMLDivElement>(null);
+
+  // ── History (undo/redo) ───────────────────────────────────────────────────
+  const historyRef    = useRef<Page[][]>([[{ id: "page-1", objects: [] }]]);
+  const historyIdxRef = useRef(0);
+  const pagesRef      = useRef<Page[]>(pages);
+  useEffect(() => { pagesRef.current = pages; }, [pages]);
+
+  const pushHistory = useCallback(() => {
+    const snapshot: Page[] = JSON.parse(JSON.stringify(pagesRef.current));
+    historyRef.current = [...historyRef.current.slice(0, historyIdxRef.current + 1), snapshot];
+    historyIdxRef.current = historyRef.current.length - 1;
+  }, []);
+
+  const undo = useCallback(() => {
+    if (historyIdxRef.current <= 0) return;
+    historyIdxRef.current--;
+    setPages(JSON.parse(JSON.stringify(historyRef.current[historyIdxRef.current])));
+    setSelectedId(null);
+  }, []);
+
+  const redo = useCallback(() => {
+    if (historyIdxRef.current >= historyRef.current.length - 1) return;
+    historyIdxRef.current++;
+    setPages(JSON.parse(JSON.stringify(historyRef.current[historyIdxRef.current])));
+    setSelectedId(null);
+  }, []);
 
   const [assets, setAssets]         = useState<AssetItem[]>([]);
   const [rightPanel, setRightPanel] = useState<"assets" | "comments">("assets");
@@ -102,29 +131,53 @@ export default function ComicEditorClient() {
   }
 
   const addObject = useCallback((pageId: string, obj: PageObj) => {
+    pushHistory();
     updatePage(pageId, objs => [...objs, obj]);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pushHistory]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const updateObject = useCallback((pageId: string, id: string, patch: Partial<PageObj>) => {
     updatePage(pageId, objs => objs.map(o => o.id === id ? { ...o, ...patch } as PageObj : o));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const deleteObject = useCallback((pageId: string, id: string) => {
+    pushHistory();
     updatePage(pageId, objs => objs.filter(o => o.id !== id));
     setSelectedId(null);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pushHistory]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Delete key ────────────────────────────────────────────────────────────
+  // ── Keyboard shortcuts ────────────────────────────────────────────────────
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key !== "Delete" && e.key !== "Backspace") return;
       const el = document.activeElement as HTMLElement;
-      if (el?.tagName === "INPUT" || el?.tagName === "TEXTAREA" || el?.isContentEditable) return;
-      if (selectedId) deleteObject(activePageId, selectedId);
+      const inInput = el?.tagName === "INPUT" || el?.tagName === "TEXTAREA" || el?.isContentEditable;
+
+      // Undo / redo — always active
+      if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) { e.preventDefault(); undo(); return; }
+      if ((e.ctrlKey || e.metaKey) && (e.key === "y" || (e.key === "z" && e.shiftKey))) { e.preventDefault(); redo(); return; }
+
+      if (inInput) return;
+
+      // Delete selected object
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (selectedId) deleteObject(activePageId, selectedId);
+        return;
+      }
+
+      // Tool shortcuts
+      const toolMap: Record<string, Tool> = { v: "select", h: "pan", f: "frame", t: "text", b: "balloon", n: "narration", c: "comment" };
+      if (toolMap[e.key.toLowerCase()]) { setTool(toolMap[e.key.toLowerCase()]); return; }
+
+      // Zoom shortcuts
+      if (e.key === "=" || e.key === "+") { handleZoom(1.2); return; }
+      if (e.key === "-") { handleZoom(1 / 1.2); return; }
+      if (e.key === "0") { setZoom(0.8); zoomRef.current = 0.8; return; }
+
+      // Escape to deselect
+      if (e.key === "Escape") { setSelectedId(null); }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectedId, activePageId, deleteObject]);
+  }, [selectedId, activePageId, deleteObject, undo, redo]);
 
   // ── Asset bank upload ─────────────────────────────────────────────────────
   const handleAssetUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -225,18 +278,20 @@ export default function ComicEditorClient() {
           {/* Left toolbar */}
           <aside style={{ width: 60, background: "#1e293b", borderRight: "1px solid #334155", display: "flex", flexDirection: "column", alignItems: "center", padding: "12px 0", gap: 6, flexShrink: 0 }}>
             {([
-              ["select",    "↖",  "Select / Move"],
-              ["pan",       "✋", "Pan"],
-              ["frame",     "⬜", "Draw Frame"],
-              ["text",      "T",  "Text Box"],
-              ["balloon",   "💬", "Speech Balloon"],
-              ["narration", "▭",  "Narration / Caption Box"],
-              ["comment",   "📌", "Add Comment"],
+              ["select",    "↖",  "Select / Move (V)"],
+              ["pan",       "✋", "Pan (H)"],
+              ["frame",     "⬜", "Draw Frame (F)"],
+              ["text",      "T",  "Text Box (T)"],
+              ["balloon",   "💬", "Speech Balloon (B)"],
+              ["narration", "▭",  "Narration / Caption Box (N)"],
+              ["comment",   "📌", "Add Comment (C)"],
             ] as [Tool, string, string][]).map(([t, icon, label]) => (
               <button key={t} title={label} onClick={() => setTool(t)} style={toolBtnStyle(tool === t)}>{icon}</button>
             ))}
             <div style={{ flex: 1 }} />
-            <button title="Add page" onClick={() => setPages(p => [...p, { id: `page-${Date.now()}`, objects: [] }])} style={toolBtnStyle(false, "#059669")}>+📄</button>
+            <button title="Undo (Ctrl+Z)" onClick={undo} disabled={historyIdxRef.current <= 0} style={toolBtnStyle(false)}>↩</button>
+            <button title="Redo (Ctrl+Y)" onClick={redo} disabled={historyIdxRef.current >= historyRef.current.length - 1} style={toolBtnStyle(false)}>↪</button>
+            <button title="Add page" onClick={() => { pushHistory(); setPages(p => [...p, { id: `page-${Date.now()}`, objects: [] }]); }} style={toolBtnStyle(false, "#059669")}>+📄</button>
             <button title="Zoom in"  onClick={() => handleZoom(1.2)}   style={toolBtnStyle(false)}>+</button>
             <button title="Zoom out" onClick={() => handleZoom(1/1.2)} style={toolBtnStyle(false)}>−</button>
           </aside>
@@ -270,6 +325,7 @@ export default function ComicEditorClient() {
                           onUpdateObject={(id, patch) => updateObject(page.id, id, patch)}
                           onDeleteObject={id => deleteObject(page.id, id)}
                           onOpenFramePicker={frameId => openFramePicker(page.id, frameId)}
+                          onPushHistory={pushHistory}
                           comments={comments.filter(c => c.pageId === page.id && !c.resolved)}
                           onCommentAdd={(x, y, text) => setComments(prev => [...prev, { id: crypto.randomUUID(), pageId: page.id, x, y, text, resolved: false }])}
                           onCommentResolve={id => setComments(prev => prev.map(c => c.id === id ? { ...c, resolved: true } : c))}
@@ -285,6 +341,22 @@ export default function ComicEditorClient() {
           {/* Right panel */}
           <aside style={{ width: 220, background: "#1e293b", borderLeft: "1px solid #334155", display: "flex", flexDirection: "column", overflow: "hidden", flexShrink: 0 }}>
 
+            {/* Text content editor */}
+            {isColorable && selectedPageObj && (
+              <div style={{ padding: "10px 12px", borderBottom: "1px solid #334155", flexShrink: 0 }}>
+                <TextContentEditor
+                  key={selectedPageObj.id}
+                  id={selectedPageObj.id}
+                  content={(selectedPageObj as { content: string }).content}
+                  fontFamily={getObjFont()}
+                  fontSize={((selectedPageObj as unknown as Record<string, number>).fontSize) ?? 16}
+                  textColor={getObjColor("textColor", "#0f172a")}
+                  onContentChange={html => updateObject(activePageId, selectedPageObj.id, { content: html } as Partial<PageObj>)}
+                  onFontSizeChange={size => updateObject(activePageId, selectedPageObj.id, { fontSize: size } as unknown as Partial<PageObj>)}
+                />
+              </div>
+            )}
+
             {/* Properties inspector */}
             {isColorable && (
               <div style={{ padding: "10px 12px", borderBottom: "1px solid #334155", flexShrink: 0, display: "flex", flexDirection: "column", gap: 8 }}>
@@ -292,12 +364,14 @@ export default function ComicEditorClient() {
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <span style={{ fontSize: 12, color: "#94a3b8", flex: 1 }}>Background</span>
                   <input type="color" value={getObjColor("bgColor", "#ffffff")}
+                    onMouseDown={pushHistory}
                     onChange={e => updateObject(activePageId, selectedPageObj!.id, { bgColor: e.target.value } as Partial<PageObj>)}
                     style={{ width: 32, height: 26, border: "1px solid #334155", borderRadius: 4, padding: 1, cursor: "pointer", background: "none" }} />
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <span style={{ fontSize: 12, color: "#94a3b8", flex: 1 }}>Text color</span>
                   <input type="color" value={getObjColor("textColor", "#0f172a")}
+                    onMouseDown={pushHistory}
                     onChange={e => updateObject(activePageId, selectedPageObj!.id, { textColor: e.target.value } as Partial<PageObj>)}
                     style={{ width: 32, height: 26, border: "1px solid #334155", borderRadius: 4, padding: 1, cursor: "pointer", background: "none" }} />
                 </div>
@@ -305,6 +379,7 @@ export default function ComicEditorClient() {
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <span style={{ fontSize: 12, color: "#94a3b8", flex: 1 }}>Border color</span>
                     <input type="color" value={getObjColor("borderColor", "#1e293b")}
+                      onMouseDown={pushHistory}
                       onChange={e => updateObject(activePageId, selectedPageObj!.id, { borderColor: e.target.value } as Partial<PageObj>)}
                       style={{ width: 32, height: 26, border: "1px solid #334155", borderRadius: 4, padding: 1, cursor: "pointer", background: "none" }} />
                   </div>
@@ -313,6 +388,7 @@ export default function ComicEditorClient() {
                   <span style={{ fontSize: 12, color: "#94a3b8" }}>Font</span>
                   <select
                     value={getObjFont()}
+                    onMouseDown={pushHistory}
                     onChange={e => updateObject(activePageId, selectedPageObj!.id, { fontFamily: e.target.value } as Partial<PageObj>)}
                     style={{ background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: "4px 6px", fontSize: 12, cursor: "pointer", width: "100%" }}
                   >
@@ -391,6 +467,7 @@ export default function ComicEditorClient() {
           <span>Zoom: <strong style={{ color: "#10b981" }}>{Math.round(zoom * 100)}%</strong></span>
           <span>Pages: <strong style={{ color: "#94a3b8" }}>{pages.length}</strong></span>
           <span style={{ color: "#475569" }}>Draw frame → drop or click to add image</span>
+          <span style={{ color: "#475569", marginLeft: "auto" }}>V·H·F·T·B·N·C = tools &nbsp;|&nbsp; Ctrl+Z/Y = undo/redo &nbsp;|&nbsp; +/− = zoom &nbsp;|&nbsp; Del = delete</span>
         </footer>
       </div>
 
@@ -414,6 +491,7 @@ interface PageCanvasProps {
   onUpdateObject: (id: string, patch: Partial<PageObj>) => void;
   onDeleteObject: (id: string) => void;
   onOpenFramePicker: (frameId: string) => void;
+  onPushHistory: () => void;
   comments: CommentPin[];
   onCommentAdd: (x: number, y: number, text: string) => void;
   onCommentResolve: (id: string) => void;
@@ -427,14 +505,14 @@ function PageCanvas({
   page, isActive, zoom, toolRef,
   selectedId, onSelect, onDeselect,
   onAddObject, onUpdateObject, onDeleteObject,
-  onOpenFramePicker, comments, onCommentAdd, onCommentResolve,
+  onOpenFramePicker, onPushHistory, comments, onCommentAdd, onCommentResolve,
 }: PageCanvasProps) {
   const pageRef    = useRef<HTMLDivElement>(null);
   const [drawing, setDrawing]         = useState<DrawPreview | null>(null);
   const drawStartRef  = useRef<{ x: number; y: number } | null>(null);
   const moveStateRef  = useRef<MoveState | null>(null);
   const resizeStateRef = useRef<ResizeState | null>(null);
-  const [editingId, setEditingId]     = useState<string | null>(null);
+  const [editingId, setEditingId]     = useState<string | null>(null); // kept for sidebar focus
   const [commentDraft, setCommentDraft] = useState<{ x: number; y: number } | null>(null);
   const [commentText, setCommentText]   = useState("");
   const [pendingStemId, setPendingStemId] = useState<string | null>(null);
@@ -501,6 +579,7 @@ function PageCanvas({
         } else {
           onSelect(hit.id);
           setShiftSelectedId(null);
+          onPushHistory();
           moveStateRef.current = { id: hit.id, startObjX: hit.x, startObjY: hit.y, startMX: p.x, startMY: p.y };
           pageRef.current!.setPointerCapture(e.pointerId);
         }
@@ -598,6 +677,7 @@ function PageCanvas({
     e.stopPropagation();
     const obj = page.objects.find(o => o.id === balloonId) as BalloonObj | undefined;
     if (!obj) return;
+    onPushHistory();
     stemDragRef.current = { id: balloonId, scx: obj.x + obj.w / 2, scy: obj.y + obj.h / 2 };
     pageRef.current!.setPointerCapture(e.pointerId);
   }
@@ -634,7 +714,7 @@ function PageCanvas({
           onAddObject({ id, kind: "frame", ...drawing });
           onSelect(id);
         } else if (t === "text") {
-          onAddObject({ id, kind: "text", ...drawing, content: "Type here…", fontSize: 16 });
+          onAddObject({ id, kind: "text", ...drawing, content: "Type here…" });
           onSelect(id);
           setEditingId(id);
         } else if (t === "balloon") {
@@ -644,7 +724,7 @@ function PageCanvas({
           setPendingStemId(id);
           setStemPreviewTip({ x: drawing.x + drawing.w / 2, y: drawing.y + drawing.h / 2 + stemDy });
         } else if (t === "narration") {
-          onAddObject({ id, kind: "narration", ...drawing, content: "Narrator text…", fontSize: 14, bgColor: "#fef9c3", textColor: "#1e293b" });
+          onAddObject({ id, kind: "narration", ...drawing, content: "Narrator text…", bgColor: "#fef9c3", textColor: "#1e293b" });
           onSelect(id);
           setEditingId(id);
         }
@@ -678,6 +758,7 @@ function PageCanvas({
     e.stopPropagation();
     const obj = page.objects.find(o => o.id === id);
     if (!obj) return;
+    onPushHistory();
     const p = pagePoint(e);
     resizeStateRef.current = { id, handle, origX: obj.x, origY: obj.y, origW: obj.w, origH: obj.h, startMX: p.x, startMY: p.y };
     pageRef.current!.setPointerCapture(e.pointerId);
@@ -714,6 +795,13 @@ function PageCanvas({
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
+        onDoubleClick={e => {
+          if (toolRef.current !== "select") return;
+          const rect = pageRef.current!.getBoundingClientRect();
+          const px = (e.clientX - rect.left) / zoom, py = (e.clientY - rect.top) / zoom;
+          const hit = hitTest(px, py);
+          if (hit && (hit.kind === "balloon" || hit.kind === "text" || hit.kind === "narration")) setEditingId(hit.id);
+        }}
         onDragOver={e => e.preventDefault()}
         onDrop={onDrop}
       >
@@ -736,16 +824,10 @@ function PageCanvas({
               <FrameRenderer key={obj.id} frame={obj} isSelected={isSel} onOpenPicker={() => onOpenFramePicker(obj.id)} />
             );
             if (obj.kind === "text") return (
-              <TextRenderer key={obj.id} obj={obj} isSelected={isSel} isEditing={editingId === obj.id}
-                onDoubleClick={() => setEditingId(obj.id)}
-                onContentChange={content => onUpdateObject(obj.id, { content } as Partial<TextObj>)}
-                onBlur={() => setEditingId(null)} />
+              <TextRenderer key={obj.id} obj={obj} isSelected={isSel} />
             );
             if (obj.kind === "narration") return (
-              <NarrationRenderer key={obj.id} obj={obj} isSelected={isSel} isEditing={editingId === obj.id}
-                onDoubleClick={() => setEditingId(obj.id)}
-                onContentChange={content => onUpdateObject(obj.id, { content } as Partial<NarrationObj>)}
-                onBlur={() => setEditingId(null)} />
+              <NarrationRenderer key={obj.id} obj={obj} isSelected={isSel} />
             );
             if (obj.kind === "balloon") {
               const balloon = obj as BalloonObj;
@@ -757,15 +839,9 @@ function PageCanvas({
                 if (mergedPartner) renderedAsPartner.add(mergedPartner.id);
               }
               return (
-                <BalloonRenderer key={obj.id} obj={balloon} allBalloons={allBalloons} isSelected={isSel} isEditing={editingId === obj.id}
+                <BalloonRenderer key={obj.id} obj={balloon} allBalloons={allBalloons} isSelected={isSel}
                   incomingConnections={incomingConnections}
                   mergedPartner={mergedPartner}
-                  mergedPartnerEditing={mergedPartner ? editingId === mergedPartner.id : false}
-                  onDoubleClick={() => setEditingId(obj.id)}
-                  onPartnerDoubleClick={() => mergedPartner && setEditingId(mergedPartner.id)}
-                  onContentChange={content => onUpdateObject(obj.id, { content } as Partial<BalloonObj>)}
-                  onPartnerContentChange={content => mergedPartner && onUpdateObject(mergedPartner.id, { content } as Partial<BalloonObj>)}
-                  onBlur={() => setEditingId(null)}
                   onStemDragStart={e => startStemDrag(obj.id, e)}
                   onStemBendDragStart={(ang, e) => startStemBendDrag(obj.id, ang, e)}
                   onStemOriginDragStart={e => startStemOriginDrag(obj.id, e)} />
@@ -937,31 +1013,141 @@ function FrameRenderer({ frame, isSelected, onOpenPicker }: { frame: FrameObj; i
   );
 }
 
-// ── TextRenderer ──────────────────────────────────────────────────────────────
+// ── FitText — auto-sizes text to fill its container ──────────────────────────
 
-function TextRenderer({ obj, isSelected, isEditing, onDoubleClick, onContentChange, onBlur }: {
-  obj: TextObj; isSelected: boolean; isEditing: boolean;
-  onDoubleClick: () => void; onContentChange: (c: string) => void; onBlur: () => void;
+function FitText({ html, fontFamily, color, align, w, h, lineHeight = 1.3 }: {
+  html: string; fontFamily: string; color: string; align?: string; w: number; h: number; lineHeight?: number;
 }) {
-  const textColor = obj.textColor ?? "#0f172a";
-  const font = obj.fontFamily ?? "Bangers, cursive";
+  const ref = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    let lo = 6, hi = 120;
+    for (let i = 0; i < 10; i++) {
+      const mid = (lo + hi) / 2;
+      el.style.fontSize = mid + "px";
+      if (el.scrollHeight <= h * 0.78) lo = mid; else hi = mid;
+    }
+    el.style.fontSize = Math.floor(lo) + "px";
+  }, [html, w, h, fontFamily]);
+
   return (
     <div
-      style={{ position: "absolute", left: obj.x, top: obj.y, width: obj.w, minHeight: obj.h, border: isSelected ? "1.5px solid #3b82f6" : "1.5px dashed #94a3b8", padding: 6, background: obj.bgColor ?? "transparent" }}
-      onDoubleClick={onDoubleClick}
-    >
-      {isEditing ? (
-        <textarea
-          autoFocus value={obj.content} onChange={e => onContentChange(e.target.value)} onBlur={onBlur}
-          style={{
-            width: "100%", minHeight: obj.h - 12, border: "none", outline: "none", resize: "none",
-            background: "transparent", fontFamily: font, fontSize: obj.fontSize, color: textColor, lineHeight: 1.3,
+      ref={ref}
+      style={{ fontFamily, color, textAlign: align as React.CSSProperties["textAlign"], lineHeight, width: w, wordBreak: "break-word" }}
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  );
+}
+
+// ── TextContentEditor (sidebar rich-text editor) ─────────────────────────────
+
+function TextContentEditor({ id, content, fontFamily, fontSize, textColor, onContentChange, onFontSizeChange }: {
+  id: string; content: string; fontFamily: string; fontSize: number | undefined; textColor: string;
+  onContentChange: (html: string) => void; onFontSizeChange: (size: number | undefined) => void;
+}) {
+  const editorRef = useRef<HTMLDivElement>(null);
+  const savedRangeRef = useRef<Range | null>(null);
+  const [sizeVal, setSizeVal] = useState("");
+
+  // Re-initialise editor content only when the selected object changes
+  useEffect(() => {
+    if (editorRef.current) editorRef.current.innerHTML = content;
+    savedRangeRef.current = null;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  function saveSelection() {
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0 && editorRef.current?.contains(sel.anchorNode)) {
+      savedRangeRef.current = sel.getRangeAt(0).cloneRange();
+    }
+  }
+
+  function applyFontSize(px: number) {
+    const editor = editorRef.current;
+    if (!editor) return;
+    // Restore saved selection (focus was stolen by the <select>)
+    const sel = window.getSelection();
+    let range: Range | null = null;
+    if (sel && sel.rangeCount > 0 && editor.contains(sel.anchorNode) && !sel.isCollapsed) {
+      range = sel.getRangeAt(0);
+    } else if (savedRangeRef.current && !savedRangeRef.current.collapsed) {
+      sel?.removeAllRanges();
+      sel?.addRange(savedRangeRef.current);
+      range = savedRangeRef.current;
+    }
+    if (!range || range.collapsed) {
+      // No selection — update object-level default font size
+      onFontSizeChange(px);
+      return;
+    }
+    const span = document.createElement("span");
+    span.style.fontSize = px + "px";
+    try {
+      range.surroundContents(span);
+    } catch {
+      const frag = range.extractContents();
+      span.appendChild(frag);
+      range.insertNode(span);
+    }
+    editor.focus();
+    onContentChange(editor.innerHTML);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <span style={{ fontSize: 10, color: "#64748b", fontFamily: "Bangers, cursive", letterSpacing: 1, textTransform: "uppercase" }}>Text</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{ fontSize: 11, color: "#94a3b8", flexShrink: 0 }}>Size</span>
+        <select
+          value={sizeVal}
+          onMouseDown={saveSelection}
+          onChange={e => {
+            const raw = e.target.value;
+            setSizeVal("");
+            if (raw === "auto") { onFontSizeChange(undefined); return; }
+            const size = Number(raw);
+            if (size) applyFontSize(size);
           }}
-        />
+          style={{ flex: 1, background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: "3px 5px", fontSize: 11, cursor: "pointer" }}
+        >
+          <option value="">Size…</option>
+          <option value="auto">Auto (fit)</option>
+          {FONT_SIZES.map(s => <option key={s} value={s}>{s}px</option>)}
+        </select>
+      </div>
+      <div
+        ref={editorRef}
+        contentEditable
+        suppressContentEditableWarning
+        onInput={() => { if (editorRef.current) onContentChange(editorRef.current.innerHTML); }}
+        onBlur={saveSelection}
+        style={{
+          minHeight: 72, background: "#0f172a", border: "1px solid #334155", borderRadius: 4,
+          padding: 8, color: textColor === "#0f172a" ? "#e2e8f0" : textColor,
+          fontFamily, fontSize, lineHeight: 1.4,
+          outline: "none", wordBreak: "break-word",
+        }}
+      />
+    </div>
+  );
+}
+
+// ── TextRenderer ──────────────────────────────────────────────────────────────
+
+function TextRenderer({ obj, isSelected }: { obj: TextObj; isSelected: boolean }) {
+  const textColor = obj.textColor ?? "#0f172a";
+  const font = obj.fontFamily ?? "Bangers, cursive";
+  const pad = 6;
+  const innerW = obj.w - pad * 2, innerH = obj.h - pad * 2;
+  return (
+    <div style={{ position: "absolute", left: obj.x, top: obj.y, width: obj.w, height: obj.h, border: isSelected ? "1.5px solid #3b82f6" : "1.5px dashed #94a3b8", padding: pad, background: obj.bgColor ?? "transparent", pointerEvents: "none", overflow: "hidden", boxSizing: "border-box" }}>
+      {obj.fontSize ? (
+        <div style={{ fontFamily: font, fontSize: obj.fontSize, color: textColor, lineHeight: 1.3 }} dangerouslySetInnerHTML={{ __html: obj.content }} />
       ) : (
-        <div style={{ fontFamily: font, fontSize: obj.fontSize, color: textColor, lineHeight: 1.3, whiteSpace: "pre-wrap", pointerEvents: "none" }}>
-          {obj.content}
-        </div>
+        <FitText html={obj.content} fontFamily={font} color={textColor} w={innerW} h={innerH} />
       )}
     </div>
   );
@@ -969,40 +1155,27 @@ function TextRenderer({ obj, isSelected, isEditing, onDoubleClick, onContentChan
 
 // ── NarrationRenderer ─────────────────────────────────────────────────────────
 
-function NarrationRenderer({ obj, isSelected, isEditing, onDoubleClick, onContentChange, onBlur }: {
-  obj: NarrationObj; isSelected: boolean; isEditing: boolean;
-  onDoubleClick: () => void; onContentChange: (c: string) => void; onBlur: () => void;
-}) {
+function NarrationRenderer({ obj, isSelected }: { obj: NarrationObj; isSelected: boolean }) {
+  const font = obj.fontFamily ?? "Bangers, cursive";
+  const padX = 8, padY = 5;
+  const innerW = obj.w - padX * 2, innerH = obj.h - padY * 2;
   return (
-    <div
-      style={{
-        position: "absolute", left: obj.x, top: obj.y, width: obj.w, minHeight: obj.h,
-        border: `2px solid ${obj.borderColor ?? obj.textColor}`,
-        background: obj.bgColor, padding: "5px 8px",
-      }}
-      onDoubleClick={onDoubleClick}
-    >
-      {(() => { const font = obj.fontFamily ?? "Bangers, cursive"; return isEditing ? (
-        <textarea autoFocus value={obj.content} onChange={e => onContentChange(e.target.value)} onBlur={onBlur}
-          style={{ width: "100%", minHeight: obj.h - 10, border: "none", outline: "none", resize: "none", background: "transparent", fontFamily: font, fontSize: obj.fontSize, color: obj.textColor, lineHeight: 1.35 }}
-        />
+    <div style={{ position: "absolute", left: obj.x, top: obj.y, width: obj.w, height: obj.h, border: `2px solid ${obj.borderColor ?? obj.textColor}`, background: obj.bgColor, padding: `${padY}px ${padX}px`, pointerEvents: "none", overflow: "hidden", boxSizing: "border-box" }}>
+      {obj.fontSize ? (
+        <div style={{ fontFamily: font, fontSize: obj.fontSize, color: obj.textColor, lineHeight: 1.35 }} dangerouslySetInnerHTML={{ __html: obj.content }} />
       ) : (
-        <div style={{ fontFamily: font, fontSize: obj.fontSize, color: obj.textColor, lineHeight: 1.35, whiteSpace: "pre-wrap", pointerEvents: "none" }}>
-          {obj.content}
-        </div>
-      ); })()}
+        <FitText html={obj.content} fontFamily={font} color={obj.textColor} w={innerW} h={innerH} lineHeight={1.35} />
+      )}
     </div>
   );
 }
 
 // ── BalloonRenderer ───────────────────────────────────────────────────────────
 
-function BalloonRenderer({ obj, allBalloons, isSelected, isEditing, incomingConnections, mergedPartner, mergedPartnerEditing, onDoubleClick, onPartnerDoubleClick, onContentChange, onPartnerContentChange, onBlur, onStemDragStart, onStemBendDragStart, onStemOriginDragStart }: {
-  obj: BalloonObj; allBalloons: BalloonObj[]; isSelected: boolean; isEditing: boolean;
+function BalloonRenderer({ obj, allBalloons, isSelected, incomingConnections, mergedPartner, onStemDragStart, onStemBendDragStart, onStemOriginDragStart }: {
+  obj: BalloonObj; allBalloons: BalloonObj[]; isSelected: boolean;
   incomingConnections: BalloonObj[];
-  mergedPartner?: BalloonObj; mergedPartnerEditing: boolean;
-  onDoubleClick: () => void; onPartnerDoubleClick: () => void;
-  onContentChange: (c: string) => void; onPartnerContentChange: (c: string) => void; onBlur: () => void;
+  mergedPartner?: BalloonObj;
   onStemDragStart: (e: React.PointerEvent) => void;
   onStemBendDragStart: (ang: number, e: React.PointerEvent) => void;
   onStemOriginDragStart: (e: React.PointerEvent) => void;
@@ -1038,7 +1211,7 @@ function BalloonRenderer({ obj, allBalloons, isSelected, isEditing, incomingConn
   const stemAng = Math.atan2(tipY - cy, tipX - cx);
   // For connected balloons, allow independent control of where the stem exits the body
   const stemBaseAng = (connectedTarget && obj.stemOriginAng !== undefined) ? obj.stemOriginAng : stemAng;
-  const delta = 0.10;
+  const delta = connectedTarget ? 0.0625 : 0.10;
   const b1x = cx + rx * Math.cos(stemBaseAng + delta), b1y = cy + ry * Math.sin(stemBaseAng + delta);
   const b2x = cx + rx * Math.cos(stemBaseAng - delta), b2y = cy + ry * Math.sin(stemBaseAng - delta);
 
@@ -1100,19 +1273,19 @@ function BalloonRenderer({ obj, allBalloons, isSelected, isEditing, incomingConn
     const insideA = (px: number, py: number) => ((px - cx) / rx) ** 2 + ((py - cy) / ry) ** 2 < 1;
 
     // Binary-search for the precise angle where arc crosses the ellipse boundary.
-    function findCrossing(
+    const findCrossing = (
       loAng: number, hiAng: number,
       ecx: number, ecy: number, erx: number, ery: number,
       inside: (px: number, py: number) => boolean,
       wantInside: boolean
-    ): number {
+    ): number => {
       for (let k = 0; k < 10; k++) {
         const mid = (loAng + hiAng) / 2;
         const mpx = ecx + erx * Math.cos(mid), mpy = ecy + ery * Math.sin(mid);
         if (inside(mpx, mpy) === wantInside) hiAng = mid; else loAng = mid;
       }
       return (loAng + hiAng) / 2;
-    }
+    };
 
     // Exterior arc of A: walk the stem-gap arc, skip points inside B; snap to exact crossing
     const NE = 128;
@@ -1171,20 +1344,20 @@ function BalloonRenderer({ obj, allBalloons, isSelected, isEditing, incomingConn
     const stemFillD = `M ${b2x.toFixed(2)},${b2y.toFixed(2)} Q ${cp1x.toFixed(2)},${cp1y.toFixed(2)} ${tipX.toFixed(2)},${tipY.toFixed(2)} Q ${cp2x.toFixed(2)},${cp2y.toFixed(2)} ${b1x.toFixed(2)},${b1y.toFixed(2)} Z`;
     const stemStrokeD = `M ${b2x.toFixed(2)},${b2y.toFixed(2)} Q ${cp1x.toFixed(2)},${cp1y.toFixed(2)} ${tipX.toFixed(2)},${tipY.toFixed(2)} Q ${cp2x.toFixed(2)},${cp2y.toFixed(2)} ${b1x.toFixed(2)},${b1y.toFixed(2)}`;
 
-    const renderText = (b: BalloonObj, bCx: number, bCy: number, bRx: number, bRy: number,
-      editing: boolean, dblClick: () => void, change: (c: string) => void) => (
-      <div key={b.id}
-        style={{ position: "absolute", left: bCx - bRx + 12, top: bCy - bRy + 10, width: b.w - 24, height: b.h - 20, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: editing ? "auto" : "none" }}
-        onDoubleClick={dblClick}
-      >
-        {editing ? (
-          <textarea autoFocus value={b.content} onChange={e => change(e.target.value)} onBlur={onBlur}
-            style={{ width: "100%", height: "100%", border: "none", outline: "none", resize: "none", background: "transparent", fontFamily: font, fontSize: 16, color: textColor, textAlign: "center", lineHeight: 1.3 }} />
-        ) : (
-          <div style={{ fontFamily: font, fontSize: 16, color: textColor, textAlign: "center", lineHeight: 1.3, whiteSpace: "pre-wrap" }}>{b.content}</div>
-        )}
-      </div>
-    );
+    const renderText = (b: BalloonObj, bCx: number, bCy: number, bRx: number, bRy: number) => {
+      const iw = b.w - 24, ih = b.h - 20;
+      return (
+        <div key={b.id}
+          style={{ position: "absolute", left: bCx - bRx + 12, top: bCy - bRy + 10, width: iw, height: ih, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", overflow: "hidden" }}
+        >
+          {b.fontSize ? (
+            <div style={{ fontFamily: font, fontSize: b.fontSize, color: textColor, textAlign: "center", lineHeight: 1.3 }} dangerouslySetInnerHTML={{ __html: b.content }} />
+          ) : (
+            <FitText html={b.content} fontFamily={font} color={textColor} align="center" w={iw} h={ih} />
+          )}
+        </div>
+      );
+    };
 
     return (
       <>
@@ -1210,8 +1383,8 @@ function BalloonRenderer({ obj, allBalloons, isSelected, isEditing, incomingConn
             </>
           )}
         </svg>
-        {renderText(obj, cx, cy, rx, ry, isEditing, onDoubleClick, onContentChange)}
-        {renderText(mergedPartner, Bcx, Bcy, Brx, Bry, mergedPartnerEditing, onPartnerDoubleClick, onPartnerContentChange)}
+        {renderText(obj, cx, cy, rx, ry)}
+        {renderText(mergedPartner, Bcx, Bcy, Brx, Bry)}
       </>
     );
   }
@@ -1276,25 +1449,11 @@ function BalloonRenderer({ obj, allBalloons, isSelected, isEditing, incomingConn
         )}
       </svg>
 
-      <div
-        style={{
-          position: "absolute",
-          left: cx - rx + 12, top: cy - ry + 10,
-          width: obj.w - 24, height: obj.h - 20,
-          display: "flex", alignItems: "center", justifyContent: "center",
-          pointerEvents: isEditing ? "auto" : "none",
-        }}
-        onDoubleClick={onDoubleClick}
-      >
-        {isEditing ? (
-          <textarea
-            autoFocus value={obj.content} onChange={e => onContentChange(e.target.value)} onBlur={onBlur}
-            style={{ width: "100%", height: "100%", border: "none", outline: "none", resize: "none", background: "transparent", fontFamily: "Bangers, cursive", fontSize: 16, color: textColor, textAlign: "center", lineHeight: 1.3 }}
-          />
+      <div style={{ position: "absolute", left: cx - rx + 12, top: cy - ry + 10, width: obj.w - 24, height: obj.h - 20, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", overflow: "hidden" }}>
+        {obj.fontSize ? (
+          <div style={{ fontFamily: font, fontSize: obj.fontSize, color: textColor, textAlign: "center", lineHeight: 1.3 }} dangerouslySetInnerHTML={{ __html: obj.content }} />
         ) : (
-          <div style={{ fontFamily: font, fontSize: 16, color: textColor, textAlign: "center", lineHeight: 1.3, whiteSpace: "pre-wrap" }}>
-            {obj.content}
-          </div>
+          <FitText html={obj.content} fontFamily={font} color={textColor} align="center" w={obj.w - 24} h={obj.h - 20} />
         )}
       </div>
     </>
