@@ -1,10 +1,12 @@
 "use client";
 
 import React, { useRef, useState, useCallback, useEffect, useLayoutEffect } from "react";
+import * as Y from "yjs";
+import YPartyKitProvider from "y-partykit/provider";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type Tool = "select" | "pan" | "frame" | "text" | "balloon" | "narration" | "comment";
+type Tool = "select" | "pan" | "frame" | "text" | "balloon" | "narration" | "comment" | "wordart";
 
 type FrameObj     = { id: string; kind: "frame";     x: number; y: number; w: number; h: number; imageUrl?: string };
 type TextObj      = { id: string; kind: "text";      x: number; y: number; w: number; h: number; content: string; fontSize?: number; textColor?: string; bgColor?: string; fontFamily?: string };
@@ -21,7 +23,29 @@ type BalloonObj   = {
   textColor?: string; bgColor?: string; borderColor?: string; fontFamily?: string;
 };
 type NarrationObj = { id: string; kind: "narration"; x: number; y: number; w: number; h: number; content: string; fontSize?: number; bgColor: string; textColor: string; borderColor?: string; fontFamily?: string };
-type PageObj = FrameObj | TextObj | BalloonObj | NarrationObj;
+
+type GradientStop = { color: string; pos: number };
+type GradientDef  = { stops: [GradientStop, GradientStop]; angle: number };
+type WordArtBg    =
+  | { type: "none" }
+  | { type: "solid"; color: string }
+  | { type: "gradient" } & GradientDef
+  | { type: "image"; url: string };
+type WordArtObj   = {
+  id: string; kind: "wordart";
+  x: number; y: number; w: number; h: number;
+  content: string;
+  fontFamily: string;
+  fontSize: number;
+  textColor: string;
+  textGradient: GradientDef | null;
+  bg: WordArtBg;
+  curve: number;
+  outline: { color: string; width: number } | null;
+  shadow: { color: string; blur: number; dx: number; dy: number } | null;
+};
+
+type PageObj = FrameObj | TextObj | BalloonObj | NarrationObj | WordArtObj;
 
 type Page = { id: string; objects: PageObj[] };
 type CommentPin = { id: string; pageId: string; x: number; y: number; text: string; resolved: boolean };
@@ -93,9 +117,103 @@ export default function ComicEditorClient() {
   const [rightPanel, setRightPanel] = useState<"assets" | "comments">("assets");
   const [comments, setComments]     = useState<CommentPin[]>([]);
 
-  const fileInputRef      = useRef<HTMLInputElement>(null);
-  const frameFileInputRef = useRef<HTMLInputElement>(null);
-  const pendingFrameRef   = useRef<{ pageId: string; frameId: string } | null>(null);
+  // ── Real-time collaboration (Yjs + PartyKit) ──────────────────────────────
+  const [roomId, setRoomId]       = useState<string>("");
+  const [syncStatus, setSyncStatus] = useState<"offline" | "connecting" | "connected">("offline");
+  const ydocRef                   = useRef<Y.Doc | null>(null);
+  const providerRef               = useRef<YPartyKitProvider | null>(null);
+  const applyingRemoteRef         = useRef(false);
+
+  // Initialise room from URL (or generate one and push it)
+  useEffect(() => {
+    const params  = new URLSearchParams(window.location.search);
+    let room      = params.get("room");
+    if (!room) {
+      room = crypto.randomUUID().slice(0, 8);
+      const url = new URL(window.location.href);
+      url.searchParams.set("room", room);
+      window.history.replaceState({}, "", url.toString());
+    }
+    setRoomId(room);
+  }, []);
+
+  // Connect to PartyKit once we have a roomId
+  useEffect(() => {
+    if (!roomId) return;
+    const host = process.env.NEXT_PUBLIC_PARTYKIT_HOST;
+    if (!host) return; // local-only mode — no .env set
+
+    const doc      = new Y.Doc();
+    const provider = new YPartyKitProvider(host, roomId, doc);
+    ydocRef.current    = doc;
+    providerRef.current = provider;
+    setSyncStatus("connecting");
+
+    provider.on("status", ({ status }: { status: string }) => {
+      setSyncStatus(status === "connected" ? "connected" : "connecting");
+    });
+
+    const ymap = doc.getMap<string>("comic");
+
+    // Remote → local: apply only changes from other peers
+    ymap.observe(() => {
+      if (applyingRemoteRef.current) return;
+      const rawPages    = ymap.get("pages");
+      const rawComments = ymap.get("comments");
+      if (rawPages)    { applyingRemoteRef.current = true; setPages(JSON.parse(rawPages));    applyingRemoteRef.current = false; }
+      if (rawComments) { applyingRemoteRef.current = true; setComments(JSON.parse(rawComments)); applyingRemoteRef.current = false; }
+    });
+
+    return () => {
+      provider.destroy();
+      doc.destroy();
+      ydocRef.current     = null;
+      providerRef.current = null;
+      setSyncStatus("offline");
+    };
+  }, [roomId]);
+
+  // Local → remote: push pages whenever they change
+  useEffect(() => {
+    if (applyingRemoteRef.current) return;
+    const ymap = ydocRef.current?.getMap<string>("comic");
+    if (!ymap) return;
+    ymap.set("pages", JSON.stringify(pages));
+  }, [pages]);
+
+  // Local → remote: push comments whenever they change
+  useEffect(() => {
+    if (applyingRemoteRef.current) return;
+    const ymap = ydocRef.current?.getMap<string>("comic");
+    if (!ymap) return;
+    ymap.set("comments", JSON.stringify(comments));
+  }, [comments]);
+
+  function copyShareLink() {
+    const url = new URL(window.location.href);
+    if (roomId) url.searchParams.set("room", roomId);
+    navigator.clipboard.writeText(url.toString());
+  }
+
+  const fileInputRef        = useRef<HTMLInputElement>(null);
+  const frameFileInputRef   = useRef<HTMLInputElement>(null);
+  const wordArtBgInputRef   = useRef<HTMLInputElement>(null);
+  const wordArtBgCbRef      = useRef<((url: string) => void) | null>(null);
+  const pendingFrameRef     = useRef<{ pageId: string; frameId: string } | null>(null);
+
+  const handleWordArtBgUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !wordArtBgCbRef.current) return;
+    const url = URL.createObjectURL(file);
+    wordArtBgCbRef.current(url);
+    wordArtBgCbRef.current = null;
+    e.target.value = "";
+  }, []);
+
+  function openWordArtBgPicker(cb: (url: string) => void) {
+    wordArtBgCbRef.current = cb;
+    wordArtBgInputRef.current?.click();
+  }
 
   // Pan state
   const isPanningRef = useRef(false);
@@ -113,8 +231,8 @@ export default function ComicEditorClient() {
         zoomRef.current = next;
         setZoom(next);
       } else {
-        el.scrollLeft += e.deltaX;
-        el.scrollTop  += e.deltaY;
+        el!.scrollLeft += e.deltaX;
+        el!.scrollTop  += e.deltaY;
       }
     }
     el.addEventListener("wheel", onWheel, { passive: false, capture: true });
@@ -164,7 +282,7 @@ export default function ComicEditorClient() {
       }
 
       // Tool shortcuts
-      const toolMap: Record<string, Tool> = { v: "select", h: "pan", f: "frame", t: "text", b: "balloon", n: "narration", c: "comment" };
+      const toolMap: Record<string, Tool> = { v: "select", h: "pan", f: "frame", t: "text", b: "balloon", n: "narration", w: "wordart", c: "comment" };
       if (toolMap[e.key.toLowerCase()]) { setTool(toolMap[e.key.toLowerCase()]); return; }
 
       // Zoom shortcuts
@@ -250,6 +368,7 @@ export default function ComicEditorClient() {
   const activePage = pages.find(p => p.id === activePageId);
   const selectedPageObj = activePage?.objects.find(o => o.id === selectedId) ?? null;
   const isColorable = selectedPageObj && (selectedPageObj.kind === "narration" || selectedPageObj.kind === "text" || selectedPageObj.kind === "balloon");
+  const isWordArt = selectedPageObj?.kind === "wordart";
   const hasBorder = selectedPageObj && (selectedPageObj.kind === "narration" || selectedPageObj.kind === "balloon");
   function getObjColor(key: "bgColor" | "textColor" | "borderColor", fallback: string): string {
     if (!selectedPageObj) return fallback;
@@ -271,6 +390,24 @@ export default function ComicEditorClient() {
         {/* Top bar */}
         <header style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 16px", background: "#1e293b", borderBottom: "1px solid #334155", flexShrink: 0 }}>
           <span style={{ fontFamily: "Bangers, cursive", fontSize: 22, letterSpacing: 2, color: "#3b82f6" }}>COMIC FORGE</span>
+          <span style={{ flex: 1 }} />
+          {/* Sync status dot */}
+          <span title={syncStatus} style={{
+            width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+            background: syncStatus === "connected" ? "#22c55e" : syncStatus === "connecting" ? "#f59e0b" : "#475569",
+          }} />
+          {syncStatus !== "offline" && (
+            <span style={{ fontSize: 11, color: "#64748b" }}>
+              {syncStatus === "connected" ? "Live" : "Connecting…"}
+            </span>
+          )}
+          <button
+            onClick={copyShareLink}
+            title="Copy share link"
+            style={{ padding: "4px 12px", background: "#1d4ed8", border: "none", borderRadius: 6, color: "#e2e8f0", fontSize: 12, fontFamily: "Bangers, cursive", letterSpacing: 1, cursor: "pointer" }}
+          >
+            Share
+          </button>
         </header>
 
         <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
@@ -284,6 +421,7 @@ export default function ComicEditorClient() {
               ["text",      "T",  "Text Box (T)"],
               ["balloon",   "💬", "Speech Balloon (B)"],
               ["narration", "▭",  "Narration / Caption Box (N)"],
+              ["wordart",   "✦",  "Word Art (W)"],
               ["comment",   "📌", "Add Comment (C)"],
             ] as [Tool, string, string][]).map(([t, icon, label]) => (
               <button key={t} title={label} onClick={() => setTool(t)} style={toolBtnStyle(tool === t)}>{icon}</button>
@@ -340,6 +478,16 @@ export default function ComicEditorClient() {
 
           {/* Right panel */}
           <aside style={{ width: 220, background: "#1e293b", borderLeft: "1px solid #334155", display: "flex", flexDirection: "column", overflow: "hidden", flexShrink: 0 }}>
+
+            {/* Word Art panel */}
+            {isWordArt && selectedPageObj && (
+              <WordArtPanel
+                key={selectedPageObj.id}
+                obj={selectedPageObj as WordArtObj}
+                onUpdate={patch => updateObject(activePageId, selectedPageObj.id, patch as Partial<PageObj>)}
+                onBgImageUpload={cb => openWordArtBgPicker(cb)}
+              />
+            )}
 
             {/* Text content editor */}
             {isColorable && selectedPageObj && (
@@ -471,8 +619,9 @@ export default function ComicEditorClient() {
         </footer>
       </div>
 
-      <input ref={fileInputRef}      type="file" accept="image/*" multiple style={{ display: "none" }} onChange={handleAssetUpload} />
-      <input ref={frameFileInputRef} type="file" accept="image/*"          style={{ display: "none" }} onChange={handleFrameUpload} />
+      <input ref={fileInputRef}        type="file" accept="image/*" multiple style={{ display: "none" }} onChange={handleAssetUpload} />
+      <input ref={frameFileInputRef}   type="file" accept="image/*"          style={{ display: "none" }} onChange={handleFrameUpload} />
+      <input ref={wordArtBgInputRef}   type="file" accept="image/*"          style={{ display: "none" }} onChange={handleWordArtBgUpload} />
     </>
   );
 }
@@ -727,6 +876,20 @@ function PageCanvas({
           onAddObject({ id, kind: "narration", ...drawing, content: "Narrator text…", bgColor: "#fef9c3", textColor: "#1e293b" });
           onSelect(id);
           setEditingId(id);
+        } else if (t === "wordart") {
+          onAddObject({
+            id, kind: "wordart", ...drawing,
+            content: "WORD ART",
+            fontFamily: "Bangers, cursive",
+            fontSize: 52,
+            textColor: "#ff6b35",
+            textGradient: null,
+            bg: { type: "none" },
+            curve: 25,
+            outline: { color: "#1e293b", width: 4 },
+            shadow: null,
+          });
+          onSelect(id);
         }
       }
       drawStartRef.current = null;
@@ -768,7 +931,7 @@ function PageCanvas({
 
   const drawCursor: Record<Tool, string> = {
     select: "default", pan: "grab",
-    frame: "crosshair", text: "crosshair", balloon: "crosshair", narration: "crosshair", comment: "cell",
+    frame: "crosshair", text: "crosshair", balloon: "crosshair", narration: "crosshair", wordart: "crosshair", comment: "cell",
   };
 
   function submitComment() {
@@ -828,6 +991,9 @@ function PageCanvas({
             );
             if (obj.kind === "narration") return (
               <NarrationRenderer key={obj.id} obj={obj} isSelected={isSel} />
+            );
+            if (obj.kind === "wordart") return (
+              <WordArtRenderer key={obj.id} obj={obj} isSelected={isSel} />
             );
             if (obj.kind === "balloon") {
               const balloon = obj as BalloonObj;
@@ -1531,4 +1697,428 @@ function btnStyle(bg: string): React.CSSProperties {
 
 function toolBtnStyle(active: boolean, bg?: string): React.CSSProperties {
   return { width: 40, height: 40, borderRadius: 8, background: active ? "#1d4ed8" : (bg ?? "#0f172a"), border: `1px solid ${active ? "#3b82f6" : "#334155"}`, color: active ? "#fff" : "#94a3b8", fontSize: 16, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.15s" };
+}
+
+// ── Color utilities ───────────────────────────────────────────────────────────
+
+function hsvToHex(h: number, s: number, v: number): string {
+  const f = (n: number) => {
+    const k = (n + h / 60) % 6;
+    return v - v * s * Math.max(Math.min(k, 4 - k, 1), 0);
+  };
+  const r = Math.round(f(5) * 255), g = Math.round(f(3) * 255), b = Math.round(f(1) * 255);
+  return "#" + [r, g, b].map(x => x.toString(16).padStart(2, "0")).join("");
+}
+
+function hexToHsv(hex: string): [number, number, number] {
+  const clean = hex.replace("#", "").slice(0, 6).padEnd(6, "0");
+  const r = parseInt(clean.slice(0, 2), 16) / 255;
+  const g = parseInt(clean.slice(2, 4), 16) / 255;
+  const b = parseInt(clean.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  const v = max;
+  const s = max === 0 ? 0 : d / max;
+  let hh = 0;
+  if (d !== 0) {
+    if (max === r) hh = 60 * (((g - b) / d) % 6);
+    else if (max === g) hh = 60 * ((b - r) / d + 2);
+    else hh = 60 * ((r - g) / d + 4);
+  }
+  return [hh < 0 ? hh + 360 : hh, s, v];
+}
+
+// ── ColorPicker ───────────────────────────────────────────────────────────────
+
+function ColorPicker({ value, onChange }: { value: string; onChange: (hex: string) => void }) {
+  const [hsv, setHsv] = useState<[number, number, number]>(() => hexToHsv(value));
+  const [hexInput, setHexInput] = useState(value);
+  const svRef  = useRef<HTMLDivElement>(null);
+  const hueRef = useRef<HTMLDivElement>(null);
+  const draggingSv  = useRef(false);
+  const draggingHue = useRef(false);
+
+  useEffect(() => {
+    const parsed = hexToHsv(value);
+    setHsv(parsed);
+    setHexInput(value);
+  }, [value]);
+
+  function updateHsv(h: number, s: number, v: number) {
+    const hex = hsvToHex(h, s, v);
+    setHsv([h, s, v]);
+    setHexInput(hex);
+    onChange(hex);
+  }
+
+  function handleSv(e: React.PointerEvent) {
+    const rect = svRef.current!.getBoundingClientRect();
+    const s = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const v = Math.max(0, Math.min(1, 1 - (e.clientY - rect.top) / rect.height));
+    updateHsv(hsv[0], s, v);
+  }
+
+  function handleHue(e: React.PointerEvent) {
+    const rect = hueRef.current!.getBoundingClientRect();
+    const h = Math.max(0, Math.min(360, ((e.clientX - rect.left) / rect.width) * 360));
+    updateHsv(h, hsv[1], hsv[2]);
+  }
+
+  const [h, s, v] = hsv;
+  const hueColor = hsvToHex(h, 1, 1);
+  const currentHex = hsvToHex(h, s, v);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+      {/* SV square */}
+      <div
+        ref={svRef}
+        style={{ width: "100%", height: 110, borderRadius: 5, position: "relative", cursor: "crosshair", background: hueColor, userSelect: "none", flexShrink: 0 }}
+        onPointerDown={e => { draggingSv.current = true; svRef.current!.setPointerCapture(e.pointerId); handleSv(e); }}
+        onPointerMove={e => { if (draggingSv.current) handleSv(e); }}
+        onPointerUp={() => { draggingSv.current = false; }}
+      >
+        <div style={{ position: "absolute", inset: 0, borderRadius: 5, background: "linear-gradient(to right, #fff, transparent)" }} />
+        <div style={{ position: "absolute", inset: 0, borderRadius: 5, background: "linear-gradient(to bottom, transparent, #000)" }} />
+        <div style={{
+          position: "absolute",
+          left: `${s * 100}%`, top: `${(1 - v) * 100}%`,
+          width: 12, height: 12, borderRadius: "50%",
+          border: "2px solid #fff", transform: "translate(-50%, -50%)",
+          boxShadow: "0 0 0 1px rgba(0,0,0,0.4)", pointerEvents: "none",
+        }} />
+      </div>
+      {/* Hue bar */}
+      <div
+        ref={hueRef}
+        style={{ width: "100%", height: 12, borderRadius: 6, position: "relative", cursor: "crosshair", userSelect: "none", background: "linear-gradient(to right,hsl(0,100%,50%),hsl(60,100%,50%),hsl(120,100%,50%),hsl(180,100%,50%),hsl(240,100%,50%),hsl(300,100%,50%),hsl(360,100%,50%))" }}
+        onPointerDown={e => { draggingHue.current = true; hueRef.current!.setPointerCapture(e.pointerId); handleHue(e); }}
+        onPointerMove={e => { if (draggingHue.current) handleHue(e); }}
+        onPointerUp={() => { draggingHue.current = false; }}
+      >
+        <div style={{ position: "absolute", left: `${(h / 360) * 100}%`, top: "50%", width: 16, height: 16, borderRadius: "50%", border: "2px solid #fff", background: hueColor, transform: "translate(-50%, -50%)", pointerEvents: "none", boxShadow: "0 0 0 1px rgba(0,0,0,0.4)" }} />
+      </div>
+      {/* Hex row */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <div style={{ width: 22, height: 22, borderRadius: 4, background: currentHex, border: "1px solid #475569", flexShrink: 0 }} />
+        <input
+          value={hexInput}
+          onChange={e => {
+            setHexInput(e.target.value);
+            if (/^#[0-9a-fA-F]{6}$/.test(e.target.value)) {
+              const [nh, ns, nv] = hexToHsv(e.target.value);
+              setHsv([nh, ns, nv]);
+              onChange(e.target.value);
+            }
+          }}
+          style={{ flex: 1, background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: "3px 7px", fontSize: 12, outline: "none", fontFamily: "monospace" }}
+          placeholder="#000000"
+          spellCheck={false}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ── GradientEditor ────────────────────────────────────────────────────────────
+
+function GradientEditor({ gradient, onChange }: { gradient: GradientDef; onChange: (g: GradientDef) => void }) {
+  const [activeStop, setActiveStop] = useState<0 | 1>(0);
+  const previewBg = `linear-gradient(${gradient.angle}deg, ${gradient.stops[0].color}, ${gradient.stops[1].color})`;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ height: 18, borderRadius: 4, background: previewBg, border: "1px solid #334155" }} />
+      <div style={{ display: "flex", gap: 5 }}>
+        {([0, 1] as const).map(i => (
+          <button key={i} onClick={() => setActiveStop(i)} style={{
+            flex: 1, padding: "4px 0", borderRadius: 4, cursor: "pointer",
+            background: gradient.stops[i].color,
+            border: `2px solid ${activeStop === i ? "#3b82f6" : "#334155"}`,
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}>
+            <span style={{ fontSize: 10, color: "#fff", textShadow: "0 0 4px #000", fontWeight: 700 }}>Stop {i + 1}</span>
+          </button>
+        ))}
+      </div>
+      <ColorPicker
+        value={gradient.stops[activeStop].color}
+        onChange={color => {
+          const stops: [GradientStop, GradientStop] = [{ ...gradient.stops[0] }, { ...gradient.stops[1] }];
+          stops[activeStop] = { ...stops[activeStop], color };
+          onChange({ ...gradient, stops });
+        }}
+      />
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{ fontSize: 11, color: "#94a3b8", flexShrink: 0 }}>Angle</span>
+        <input type="range" min={0} max={360} value={gradient.angle}
+          onChange={e => onChange({ ...gradient, angle: Number(e.target.value) })}
+          style={{ flex: 1 }} />
+        <span style={{ fontSize: 11, color: "#64748b", width: 30, textAlign: "right" }}>{gradient.angle}°</span>
+      </div>
+    </div>
+  );
+}
+
+// ── WordArtRenderer ───────────────────────────────────────────────────────────
+
+function WordArtRenderer({ obj, isSelected }: { obj: WordArtObj; isSelected: boolean }) {
+  const uid = obj.id.replace(/-/g, "");
+  const padX = 14;
+  const arcStartX = obj.x + padX;
+  const arcEndX   = obj.x + obj.w - padX;
+  const arcChord  = arcEndX - arcStartX;
+  const baseY     = obj.y + obj.h / 2;
+  const sagitta   = (obj.curve / 100) * obj.h * 0.45;
+
+  let textPathD: string;
+  if (Math.abs(sagitta) < 1) {
+    textPathD = `M ${arcStartX},${baseY} L ${arcEndX},${baseY}`;
+  } else {
+    const R = (arcChord * arcChord / 4 + sagitta * sagitta) / (2 * Math.abs(sagitta));
+    const sweep = sagitta > 0 ? 0 : 1;
+    textPathD = `M ${arcStartX},${baseY} A ${R},${R} 0 0,${sweep} ${arcEndX},${baseY}`;
+  }
+
+  const filterId   = `waf-${uid}`;
+  const textGradId = `watg-${uid}`;
+  const bgGradId   = `wabg-${uid}`;
+  const pathId     = `wap-${uid}`;
+
+  function gradVec(angle: number) {
+    const rad = (angle - 90) * Math.PI / 180;
+    const cx = obj.x + obj.w / 2, cy = obj.y + obj.h / 2;
+    const d = Math.sqrt(obj.w * obj.w + obj.h * obj.h) / 2;
+    return { x1: cx - Math.cos(rad) * d, y1: cy - Math.sin(rad) * d, x2: cx + Math.cos(rad) * d, y2: cy + Math.sin(rad) * d };
+  }
+
+  const tg = obj.textGradient ? gradVec(obj.textGradient.angle) : null;
+  const bg = obj.bg.type === "gradient" ? gradVec(obj.bg.angle) : null;
+
+  return (
+    <svg style={{ position: "absolute", left: 0, top: 0, width: PAGE_W, height: PAGE_H, overflow: "visible", pointerEvents: "none" }}>
+      <defs>
+        {obj.shadow && (
+          <filter id={filterId} x="-60%" y="-60%" width="220%" height="220%">
+            <feDropShadow dx={obj.shadow.dx} dy={obj.shadow.dy} stdDeviation={obj.shadow.blur / 2} floodColor={obj.shadow.color} floodOpacity="1" />
+          </filter>
+        )}
+        {obj.textGradient && tg && (
+          <linearGradient id={textGradId} gradientUnits="userSpaceOnUse" x1={tg.x1} y1={tg.y1} x2={tg.x2} y2={tg.y2}>
+            {obj.textGradient.stops.map((st, i) => <stop key={i} offset={st.pos} stopColor={st.color} />)}
+          </linearGradient>
+        )}
+        {obj.bg.type === "gradient" && bg && (
+          <linearGradient id={bgGradId} gradientUnits="userSpaceOnUse" x1={bg.x1} y1={bg.y1} x2={bg.x2} y2={bg.y2}>
+            {(obj.bg as GradientDef & { type: "gradient" }).stops.map((st, i) => <stop key={i} offset={st.pos} stopColor={st.color} />)}
+          </linearGradient>
+        )}
+        <path id={pathId} d={textPathD} />
+      </defs>
+
+      {/* Background */}
+      {obj.bg.type === "solid" && (
+        <rect x={obj.x} y={obj.y} width={obj.w} height={obj.h} fill={obj.bg.color} />
+      )}
+      {obj.bg.type === "gradient" && (
+        <rect x={obj.x} y={obj.y} width={obj.w} height={obj.h} fill={`url(#${bgGradId})`} />
+      )}
+      {obj.bg.type === "image" && (
+        <image href={obj.bg.url} x={obj.x} y={obj.y} width={obj.w} height={obj.h} preserveAspectRatio="xMidYMid slice" />
+      )}
+
+      {/* Text */}
+      <text
+        fill={obj.textGradient ? `url(#${textGradId})` : obj.textColor}
+        fontFamily={obj.fontFamily}
+        fontSize={obj.fontSize}
+        fontWeight="bold"
+        stroke={obj.outline ? obj.outline.color : "none"}
+        strokeWidth={obj.outline ? obj.outline.width : 0}
+        paintOrder="stroke fill"
+        filter={obj.shadow ? `url(#${filterId})` : undefined}
+      >
+        <textPath href={`#${pathId}`} startOffset="50%" textAnchor="middle">
+          {obj.content}
+        </textPath>
+      </text>
+
+      {/* Selection indicator */}
+      {isSelected && (
+        <rect x={obj.x} y={obj.y} width={obj.w} height={obj.h} fill="none" stroke="#3b82f6" strokeWidth={1.5} strokeDasharray="4,2" />
+      )}
+    </svg>
+  );
+}
+
+// ── WordArtPanel ──────────────────────────────────────────────────────────────
+
+function WordArtPanel({ obj, onUpdate, onBgImageUpload }: {
+  obj: WordArtObj;
+  onUpdate: (patch: Partial<WordArtObj>) => void;
+  onBgImageUpload: (cb: (url: string) => void) => void;
+}) {
+  const [textFillMode, setTextFillMode] = useState<"solid" | "gradient">(obj.textGradient ? "gradient" : "solid");
+  const [bgMode, setBgMode]             = useState<WordArtBg["type"]>(obj.bg.type);
+
+  const sec: React.CSSProperties = { padding: "8px 12px", borderBottom: "1px solid #1e293b" };
+  const lbl: React.CSSProperties = { fontSize: 10, color: "#64748b", fontFamily: "Bangers, cursive", letterSpacing: 1, textTransform: "uppercase", display: "block", marginBottom: 6 };
+  const tab = (on: boolean): React.CSSProperties => ({
+    flex: 1, padding: "3px 0", borderRadius: 4, fontSize: 11, cursor: "pointer",
+    background: on ? "#3b82f6" : "#0f172a",
+    border: "1px solid " + (on ? "#3b82f6" : "#334155"),
+    color: on ? "#fff" : "#64748b",
+  });
+
+  return (
+    <div style={{ overflowY: "auto", flex: 1 }}>
+
+      {/* Content */}
+      <div style={sec}>
+        <span style={lbl}>Content</span>
+        <input
+          value={obj.content}
+          onChange={e => onUpdate({ content: e.target.value })}
+          style={{ width: "100%", background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: "5px 8px", fontSize: 14, outline: "none", boxSizing: "border-box", fontFamily: obj.fontFamily }}
+        />
+      </div>
+
+      {/* Font */}
+      <div style={sec}>
+        <span style={lbl}>Font</span>
+        <select
+          value={obj.fontFamily}
+          onChange={e => onUpdate({ fontFamily: e.target.value })}
+          style={{ width: "100%", background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: "4px 6px", fontSize: 12, cursor: "pointer", boxSizing: "border-box" }}
+        >
+          {FONTS.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
+        </select>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 7 }}>
+          <span style={{ fontSize: 11, color: "#94a3b8", flexShrink: 0 }}>Size</span>
+          <input
+            type="number" min={12} max={200} value={obj.fontSize}
+            onChange={e => onUpdate({ fontSize: Math.max(12, Math.min(200, Number(e.target.value))) })}
+            style={{ flex: 1, background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: "3px 6px", fontSize: 12, outline: "none" }}
+          />
+          <span style={{ fontSize: 11, color: "#64748b" }}>px</span>
+        </div>
+      </div>
+
+      {/* Text fill */}
+      <div style={sec}>
+        <span style={lbl}>Text fill</span>
+        <div style={{ display: "flex", gap: 4, marginBottom: 8 }}>
+          <button style={tab(textFillMode === "solid")} onClick={() => { setTextFillMode("solid"); onUpdate({ textGradient: null }); }}>Solid</button>
+          <button style={tab(textFillMode === "gradient")} onClick={() => {
+            setTextFillMode("gradient");
+            if (!obj.textGradient) onUpdate({ textGradient: { stops: [{ color: "#ff0000", pos: 0 }, { color: "#0088ff", pos: 1 }], angle: 0 } });
+          }}>Gradient</button>
+        </div>
+        {textFillMode === "solid" && (
+          <ColorPicker value={obj.textColor} onChange={color => onUpdate({ textColor: color })} />
+        )}
+        {textFillMode === "gradient" && obj.textGradient && (
+          <GradientEditor gradient={obj.textGradient} onChange={g => onUpdate({ textGradient: g })} />
+        )}
+      </div>
+
+      {/* Background */}
+      <div style={sec}>
+        <span style={lbl}>Background</span>
+        <div style={{ display: "flex", gap: 3, flexWrap: "wrap", marginBottom: 8 }}>
+          {(["none", "solid", "gradient", "image"] as const).map(t => (
+            <button key={t} style={{ ...tab(bgMode === t), flex: "none", padding: "3px 7px" }} onClick={() => {
+              setBgMode(t);
+              if (t === "none")     onUpdate({ bg: { type: "none" } });
+              if (t === "solid")    onUpdate({ bg: { type: "solid", color: obj.bg.type === "solid" ? obj.bg.color : "#ffffff" } });
+              if (t === "gradient") onUpdate({ bg: { type: "gradient", stops: [{ color: "#ff6b6b", pos: 0 }, { color: "#4ecdc4", pos: 1 }], angle: 90 } });
+              if (t === "image")    onBgImageUpload(url => onUpdate({ bg: { type: "image", url } }));
+            }}>
+              {t === "none" ? "None" : t === "solid" ? "Color" : t === "gradient" ? "Grad" : "Image"}
+            </button>
+          ))}
+        </div>
+        {bgMode === "solid" && obj.bg.type === "solid" && (
+          <ColorPicker value={obj.bg.color} onChange={color => onUpdate({ bg: { type: "solid", color } })} />
+        )}
+        {bgMode === "gradient" && obj.bg.type === "gradient" && (
+          <GradientEditor
+            gradient={{ stops: (obj.bg as GradientDef & { type: string }).stops, angle: (obj.bg as GradientDef & { type: string }).angle }}
+            onChange={g => onUpdate({ bg: { type: "gradient", ...g } })}
+          />
+        )}
+        {bgMode === "image" && obj.bg.type === "image" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <img src={obj.bg.url} alt="" style={{ width: "100%", height: 55, objectFit: "cover", borderRadius: 4, border: "1px solid #334155" }} />
+            <button onClick={() => onBgImageUpload(url => onUpdate({ bg: { type: "image", url } }))} style={{ ...btnStyle("#1e293b"), border: "1px dashed #475569", fontSize: 11 }}>
+              ⬆ Replace image
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Curve */}
+      <div style={sec}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <span style={lbl}>Curve</span>
+          <span style={{ fontSize: 11, color: "#94a3b8", marginBottom: 6 }}>{obj.curve > 0 ? "+" : ""}{obj.curve}</span>
+        </div>
+        <input type="range" min={-100} max={100} value={obj.curve}
+          onChange={e => onUpdate({ curve: Number(e.target.value) })}
+          style={{ width: "100%" }} />
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2 }}>
+          <span style={{ fontSize: 10, color: "#475569" }}>↓ arch</span>
+          <span style={{ fontSize: 10, color: "#475569" }}>arch ↑</span>
+        </div>
+      </div>
+
+      {/* Outline */}
+      <div style={sec}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <span style={lbl}>Outline</span>
+          <input type="checkbox" checked={obj.outline !== null}
+            onChange={e => onUpdate({ outline: e.target.checked ? { color: "#000000", width: 3 } : null })} />
+        </div>
+        {obj.outline && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <ColorPicker value={obj.outline.color} onChange={color => onUpdate({ outline: { ...obj.outline!, color } })} />
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ fontSize: 11, color: "#94a3b8", width: 32, flexShrink: 0 }}>Width</span>
+              <input type="range" min={1} max={24} value={obj.outline.width}
+                onChange={e => onUpdate({ outline: { ...obj.outline!, width: Number(e.target.value) } })}
+                style={{ flex: 1 }} />
+              <span style={{ fontSize: 11, color: "#64748b", width: 20, textAlign: "right" }}>{obj.outline.width}</span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Shadow */}
+      <div style={sec}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <span style={lbl}>Shadow</span>
+          <input type="checkbox" checked={obj.shadow !== null}
+            onChange={e => onUpdate({ shadow: e.target.checked ? { color: "#000000", blur: 8, dx: 4, dy: 4 } : null })} />
+        </div>
+        {obj.shadow && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <ColorPicker value={obj.shadow.color} onChange={color => onUpdate({ shadow: { ...obj.shadow!, color } })} />
+            {[
+              ["Blur", "blur", 0, 40] as const,
+              ["X",    "dx",   -30, 30] as const,
+              ["Y",    "dy",   -30, 30] as const,
+            ].map(([label, key, min, max]) => (
+              <div key={key} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 11, color: "#94a3b8", width: 28, flexShrink: 0 }}>{label}</span>
+                <input type="range" min={min} max={max} value={obj.shadow![key as keyof typeof obj.shadow] as number}
+                  onChange={e => onUpdate({ shadow: { ...obj.shadow!, [key]: Number(e.target.value) } })}
+                  style={{ flex: 1 }} />
+                <span style={{ fontSize: 11, color: "#64748b", width: 22, textAlign: "right" }}>{obj.shadow![key as keyof typeof obj.shadow]}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+    </div>
+  );
 }
