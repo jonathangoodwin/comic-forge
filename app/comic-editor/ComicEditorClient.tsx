@@ -70,6 +70,16 @@ function debounce<T extends (...args: any[]) => void>(fn: T, ms: number): T {
   }) as T;
 }
 
+function colorToHex(color: string): string {
+  if (!color || color === "transparent") return "#ffffff";
+  if (color.startsWith("#")) return color.length === 4
+    ? "#" + color[1]+color[1]+color[2]+color[2]+color[3]+color[3]
+    : color.slice(0, 7);
+  const m = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  if (m) return "#" + [m[1], m[2], m[3]].map((n: string) => parseInt(n).toString(16).padStart(2, "0")).join("");
+  return "#ffffff";
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function ComicEditorClient() {
@@ -91,6 +101,11 @@ export default function ComicEditorClient() {
   const isHistoryUpdateRef = useRef(false);
   const [selectedText, setSelectedText] = useState<string | null>(null);
   const selectedObjectRef = useRef<any>(null);
+  const [selectedType, setSelectedType] = useState<"textbox" | "balloon" | "panel" | null>(null);
+  const [selectedFill, setSelectedFill] = useState("#ffffff");
+  const [selectedStroke, setSelectedStroke] = useState("#0f172a");
+  const [selectedTextColor, setSelectedTextColor] = useState("#0f172a");
+  const selectedShapeRef = useRef<any>(null);
 
   useEffect(() => { activeToolRef.current = activeTool; }, [activeTool]);
 
@@ -173,28 +188,77 @@ export default function ComicEditorClient() {
       // ── Selection → properties sidebar ───────────────────────────────────
       const syncSidebar = () => {
         const obj = canvas.getActiveObject();
-        if (!obj) { selectedObjectRef.current = null; setSelectedText(null); return; }
-
-        if (obj.type === "textbox") {
-          selectedObjectRef.current = obj;
-          setSelectedText(String(obj.text ?? ""));
+        if (!obj) {
+          selectedObjectRef.current = null;
+          selectedShapeRef.current = null;
+          setSelectedText(null);
+          setSelectedType(null);
           return;
         }
-        // Clicking the balloon shape: find its companion text object
+
+        // Standalone textbox
+        if (obj.type === "textbox" && obj.data?.type !== "balloon-text") {
+          selectedObjectRef.current = obj;
+          selectedShapeRef.current = obj;
+          setSelectedText(String(obj.text ?? ""));
+          setSelectedType("textbox");
+          setSelectedFill(colorToHex(obj.backgroundColor || "#ffffff"));
+          setSelectedStroke("#334155");
+          setSelectedTextColor(colorToHex(obj.fill || "#0f172a"));
+          return;
+        }
+
+        // Balloon text selected directly — find companion shape
+        if (obj.type === "textbox" && obj.data?.type === "balloon-text") {
+          const shape = canvas.getObjects().find((o: any) =>
+            o.data?.type === "balloon" &&
+            Math.abs(o.left - (obj.left - 12)) < 4 &&
+            Math.abs(o.top - (obj.top - 12)) < 4
+          );
+          selectedObjectRef.current = obj;
+          selectedShapeRef.current = shape ?? null;
+          setSelectedText(String(obj.text ?? ""));
+          setSelectedType("balloon");
+          setSelectedFill(colorToHex(shape?.fill || "#ffffff"));
+          setSelectedStroke(colorToHex(shape?.stroke || "#0f172a"));
+          setSelectedTextColor(colorToHex(obj.fill || "#0f172a"));
+          return;
+        }
+
+        // Balloon shape selected — find companion text
         if (obj.data?.type === "balloon") {
-          const companion = canvas.getObjects().find((o: any) =>
+          const text = canvas.getObjects().find((o: any) =>
             o.data?.type === "balloon-text" &&
             Math.abs(o.left - (obj.left + 12)) < 4 &&
             Math.abs(o.top - (obj.top + 12)) < 4
           );
-          if (companion) {
-            selectedObjectRef.current = companion;
-            setSelectedText(String(companion.text ?? ""));
-            return;
-          }
+          selectedObjectRef.current = text ?? null;
+          selectedShapeRef.current = obj;
+          setSelectedText(text ? String(text.text ?? "") : null);
+          setSelectedType("balloon");
+          setSelectedFill(colorToHex(obj.fill || "#ffffff"));
+          setSelectedStroke(colorToHex(obj.stroke || "#0f172a"));
+          setSelectedTextColor(colorToHex(text?.fill || "#0f172a"));
+          return;
         }
+
+        // Panel (info box)
+        if (obj.data?.type === "panel") {
+          selectedObjectRef.current = null;
+          selectedShapeRef.current = obj;
+          setSelectedText(null);
+          setSelectedType("panel");
+          setSelectedFill(colorToHex(obj.fill || "#ffffff"));
+          setSelectedStroke(colorToHex(obj.stroke || "#1e293b"));
+          setSelectedTextColor("#0f172a");
+          return;
+        }
+
+        // Anything else (image, handle, etc.)
         selectedObjectRef.current = null;
+        selectedShapeRef.current = null;
         setSelectedText(null);
+        setSelectedType(null);
       };
       canvas.on("selection:created", syncSidebar);
       canvas.on("selection:updated", syncSidebar);
@@ -448,6 +512,36 @@ export default function ComicEditorClient() {
     canvas.fire("object:modified", { target: obj });
   }
 
+  function handleFillChange(color: string) {
+    const canvas = fabricRef.current;
+    const shape = selectedShapeRef.current;
+    if (!shape || !canvas) return;
+    setSelectedFill(color);
+    shape.set(selectedType === "textbox" ? "backgroundColor" : "fill", color);
+    canvas.renderAll();
+    canvas.fire("object:modified", { target: shape });
+  }
+
+  function handleStrokeChange(color: string) {
+    const canvas = fabricRef.current;
+    const shape = selectedShapeRef.current;
+    if (!shape || !canvas) return;
+    setSelectedStroke(color);
+    shape.set("stroke", color);
+    canvas.renderAll();
+    canvas.fire("object:modified", { target: shape });
+  }
+
+  function handleTextColorChange(color: string) {
+    const canvas = fabricRef.current;
+    const obj = selectedObjectRef.current;
+    if (!obj || !canvas) return;
+    setSelectedTextColor(color);
+    obj.set("fill", color);
+    canvas.renderAll();
+    canvas.fire("object:modified", { target: obj });
+  }
+
   // ── Zoom / delete ──────────────────────────────────────────────────────────
   function handleZoom(factor: number) {
     const canvas = fabricRef.current;
@@ -594,20 +688,42 @@ export default function ComicEditorClient() {
           {/* Properties panel — always visible */}
           <aside style={{ width: 220, background: "#1e293b", borderLeft: "1px solid #334155", display: "flex", flexDirection: "column", flexShrink: 0 }}>
             <div style={{ padding: "12px 16px", borderBottom: "1px solid #334155", fontFamily: "Bangers, cursive", fontSize: 16, letterSpacing: 1, color: "#3b82f6" }}>PROPERTIES</div>
-            <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-              {selectedText === null ? (
+            <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+              {selectedType === null ? (
                 <p style={{ color: "#475569", fontSize: 12, margin: 0, lineHeight: 1.5 }}>
-                  Select a text box or speech bubble to edit its text here.
+                  Select a text box, speech bubble, or panel to edit its properties.
                 </p>
               ) : (
                 <>
-                  <label style={{ fontSize: 11, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 1 }}>Text content</label>
-                  <textarea
-                    value={selectedText}
-                    onChange={e => handleSidebarTextChange(e.target.value)}
-                    rows={6}
-                    style={{ background: "#0f172a", border: "2px solid #3b82f6", color: "#f1f5f9", borderRadius: 6, padding: 10, fontSize: 15, resize: "vertical", outline: "none", fontFamily: "Bangers, cursive", lineHeight: 1.5, width: "100%", boxSizing: "border-box" }}
+                  {/* Text content — textboxes and balloons */}
+                  {(selectedType === "textbox" || selectedType === "balloon") && selectedText !== null && (
+                    <>
+                      <label style={{ fontSize: 11, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 1 }}>Text content</label>
+                      <textarea
+                        value={selectedText}
+                        onChange={e => handleSidebarTextChange(e.target.value)}
+                        rows={4}
+                        style={{ background: "#0f172a", border: "2px solid #3b82f6", color: "#f1f5f9", borderRadius: 6, padding: 10, fontSize: 15, resize: "vertical", outline: "none", fontFamily: "Bangers, cursive", lineHeight: 1.5, width: "100%", boxSizing: "border-box" }}
+                      />
+                    </>
+                  )}
+
+                  {/* Fill / background */}
+                  <ColorRow
+                    label={selectedType === "textbox" ? "Background" : "Fill"}
+                    value={selectedFill}
+                    onChange={handleFillChange}
                   />
+
+                  {/* Border — balloons and panels only */}
+                  {(selectedType === "balloon" || selectedType === "panel") && (
+                    <ColorRow label="Border" value={selectedStroke} onChange={handleStrokeChange} />
+                  )}
+
+                  {/* Text color — textboxes and balloons */}
+                  {(selectedType === "textbox" || selectedType === "balloon") && (
+                    <ColorRow label="Text color" value={selectedTextColor} onChange={handleTextColorChange} />
+                  )}
                 </>
               )}
             </div>
@@ -671,6 +787,20 @@ function CommentPinMarker({ pin, zoom, onResolve }: { pin: CommentPin; zoom: num
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function ColorRow({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+      <span style={{ fontSize: 11, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 0.8 }}>{label}</span>
+      <input
+        type="color"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        style={{ width: 40, height: 26, padding: 2, border: "1px solid #475569", borderRadius: 4, cursor: "pointer", background: "none" }}
+      />
     </div>
   );
 }
