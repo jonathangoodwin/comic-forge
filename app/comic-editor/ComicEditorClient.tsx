@@ -1,607 +1,388 @@
 "use client";
 
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useRef, useState, useCallback, useEffect, useLayoutEffect } from "react";
+import * as Y from "yjs";
+import YPartyKitProvider from "y-partykit/provider";
 
-// ── Types ────────────────────────────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
-type Tool = "select" | "panel" | "textbox" | "balloon" | "image" | "comment";
+type Tool = "select" | "pan" | "frame" | "text" | "balloon" | "narration" | "comment" | "wordart";
 
-type CommentPin = {
-  id: string;
-  x: number;
-  y: number;
-  text: string;
-  author: string;
-  createdAt: number;
-  resolved: boolean;
+type FrameObj     = { id: string; kind: "frame";     x: number; y: number; w: number; h: number; imageUrl?: string };
+type TextObj      = { id: string; kind: "text";      x: number; y: number; w: number; h: number; content: string; fontSize?: number; textColor?: string; bgColor?: string; fontFamily?: string };
+type BalloonObj   = {
+  id: string; kind: "balloon";
+  x: number; y: number; w: number; h: number;
+  content: string;
+  fontSize?: number;
+  stemDx: number; stemDy: number;   // stem tip offset from ellipse center
+  stemTargetId?: string;             // if set, stem tip snaps to edge of this balloon
+  stemBend: number;                  // lateral bend of stem sides (0 = straight)
+  stemOriginAng?: number;            // override angle where stem exits body (used when stemTargetId is set)
+  mergedPairId?: string;             // if set, rendered as compound shape with this balloon
+  textColor?: string; bgColor?: string; borderColor?: string; fontFamily?: string;
+};
+type NarrationObj = { id: string; kind: "narration"; x: number; y: number; w: number; h: number; content: string; fontSize?: number; bgColor: string; textColor: string; borderColor?: string; fontFamily?: string };
+
+type GradientStop = { color: string; pos: number };
+type GradientDef  = { stops: [GradientStop, GradientStop]; angle: number };
+type WordArtBg    =
+  | { type: "none" }
+  | { type: "solid"; color: string }
+  | { type: "gradient" } & GradientDef
+  | { type: "image"; url: string };
+type WordArtObj   = {
+  id: string; kind: "wordart";
+  x: number; y: number; w: number; h: number;
+  content: string;
+  fontFamily: string;
+  fontSize: number;
+  textColor: string;
+  textGradient: GradientDef | null;
+  bg: WordArtBg;
+  curve: number;
+  outline: { color: string; width: number } | null;
+  shadow: { color: string; blur: number; dx: number; dy: number } | null;
 };
 
-type RemoteCursor = {
-  clientId: number;
-  x: number;
-  y: number;
-  name: string;
-  color: string;
-};
+type PageObj = FrameObj | TextObj | BalloonObj | NarrationObj | WordArtObj;
+
+type Page = { id: string; objects: PageObj[] };
+type CommentPin = { id: string; pageId: string; x: number; y: number; text: string; resolved: boolean };
+type AssetItem  = { id: string; name: string; url: string; thumb: string };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const PAGE_W = 850;
-const PAGE_H = 1100;
+const STEM_DELTA_ON_TARGET = 0.13; // arc half-width on target where stem merges (slightly wider than stem base)
+const STEM_CONNECT_TIP_DELTA = 0.045; // half-width of stem tip where it enters a connected balloon
 
-const CURSOR_COLORS = [
-  "#f59e0b", "#ec4899", "#8b5cf6", "#06b6d4",
-  "#10b981", "#ef4444", "#f97316", "#84cc16",
+const FONT_SIZES = [10, 12, 14, 16, 18, 20, 24, 28, 32, 40, 48];
+
+const FONTS: { label: string; value: string }[] = [
+  { label: "Bangers",         value: "Bangers, cursive" },
+  { label: "Comic Neue",      value: "Comic Neue, sans-serif" },
+  { label: "Permanent Marker",value: "Permanent Marker, cursive" },
+  { label: "Caveat",          value: "Caveat, cursive" },
+  { label: "Anton",           value: "Anton, sans-serif" },
+  { label: "Oswald",          value: "Oswald, sans-serif" },
+  { label: "Special Elite",   value: "Special Elite, cursive" },
 ];
 
-// ── Speech balloon SVG path builder ──────────────────────────────────────────
-
-function buildBalloonPath(w: number, h: number, tx: number, ty: number, r = 18) {
-  const x = 0, y = 0;
-  const bx = w / 2;
-  const tw = 22;
-  const t1x = bx - tw / 2;
-  const t2x = bx + tw / 2;
-
-  return [
-    `M ${x + r} ${y}`,
-    `L ${x + w - r} ${y}`,
-    `Q ${x + w} ${y} ${x + w} ${y + r}`,
-    `L ${x + w} ${y + h - r}`,
-    `Q ${x + w} ${y + h} ${x + w - r} ${y + h}`,
-    `L ${t2x} ${y + h}`,
-    `L ${tx} ${ty}`,
-    `L ${t1x} ${y + h}`,
-    `L ${x + r} ${y + h}`,
-    `Q ${x} ${y + h} ${x} ${y + h - r}`,
-    `L ${x} ${y + r}`,
-    `Q ${x} ${y} ${x + r} ${y}`,
-    `Z`,
-  ].join(" ");
-}
-
-// ── Debounce helper ───────────────────────────────────────────────────────────
-
-function debounce<T extends (...args: any[]) => void>(fn: T, ms: number): T {
-  let timer: ReturnType<typeof setTimeout>;
-  return ((...args: any[]) => {
-    clearTimeout(timer);
-    timer = setTimeout(() => fn(...args), ms);
-  }) as T;
-}
-
-function colorToHex(color: string): string {
-  if (!color || color === "transparent") return "#ffffff";
-  if (color.startsWith("#")) return color.length === 4
-    ? "#" + color[1]+color[1]+color[2]+color[2]+color[3]+color[3]
-    : color.slice(0, 7);
-  const m = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-  if (m) return "#" + [m[1], m[2], m[3]].map((n: string) => parseInt(n).toString(16).padStart(2, "0")).join("");
-  return "#ffffff";
-}
+const PAGE_W   = 850;
+const PAGE_H   = 1100;
+const PAGE_GAP = 64;
+const PADDING  = 48;
 
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function ComicEditorClient() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const fabricRef = useRef<any>(null);
-  const [activeTool, setActiveTool] = useState<Tool>("select");
-  const [comments, setComments] = useState<CommentPin[]>([]);
-  const [commentDraft, setCommentDraft] = useState<{ x: number; y: number } | null>(null);
-  const [commentText, setCommentText] = useState("");
-  const [showComments, setShowComments] = useState(true);
-  const [zoom, setZoom] = useState(1);
-  const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
-  const [syncStatus, setSyncStatus] = useState<"offline" | "connecting" | "live">("offline");
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const activeToolRef = useRef<Tool>("select");
-  const isRemoteUpdateRef = useRef(false);
-  const historyRef = useRef<string[]>([]);
-  const historyIndexRef = useRef<number>(-1);
-  const isHistoryUpdateRef = useRef(false);
-  const [selectedText, setSelectedText] = useState<string | null>(null);
-  const selectedObjectRef = useRef<any>(null);
-  const [selectedType, setSelectedType] = useState<"textbox" | "balloon" | "panel" | null>(null);
-  const [selectedFill, setSelectedFill] = useState("#ffffff");
-  const [selectedStroke, setSelectedStroke] = useState("#0f172a");
-  const [selectedTextColor, setSelectedTextColor] = useState("#0f172a");
-  const selectedShapeRef = useRef<any>(null);
+  const [pages, setPages] = useState<Page[]>([{ id: "page-1", objects: [] }]);
+  const [activePageId, setActivePageId] = useState("page-1");
+  const [tool, setTool] = useState<Tool>("select");
+  const toolRef = useRef<Tool>("select");
+  useEffect(() => { toolRef.current = tool; }, [tool]);
 
-  useEffect(() => { activeToolRef.current = activeTool; }, [activeTool]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [zoom, setZoom] = useState(0.8);
+  const zoomRef = useRef(0.8);
+  const mainRef = useRef<HTMLDivElement>(null);
 
-  // ── Init Fabric canvas + Yjs sync ──────────────────────────────────────────
-  useEffect(() => {
-    if (!canvasRef.current) return;
+  // ── History (undo/redo) ───────────────────────────────────────────────────
+  const historyRef    = useRef<Page[][]>([[{ id: "page-1", objects: [] }]]);
+  const historyIdxRef = useRef(0);
+  const pagesRef      = useRef<Page[]>(pages);
+  useEffect(() => { pagesRef.current = pages; }, [pages]);
 
-    let cleanup: (() => void) | undefined;
-
-    import("fabric").then(async ({ fabric }) => {
-      // ── Canvas setup ──────────────────────────────────────────────────────
-      const canvas = new fabric.Canvas(canvasRef.current!, {
-        width: PAGE_W,
-        height: PAGE_H,
-        backgroundColor: "#ffffff",
-        selection: true,
-        preserveObjectStacking: true,
-      });
-      fabricRef.current = canvas;
-
-      const border = new fabric.Rect({
-        left: 0, top: 0, width: PAGE_W - 1, height: PAGE_H - 1,
-        fill: "transparent", stroke: "#334155", strokeWidth: 1,
-        selectable: false, evented: false, hoverCursor: "default",
-      });
-      canvas.add(border);
-      canvas.sendToBack(border);
-
-      // ── Tool-based mouse handler ──────────────────────────────────────────
-      canvas.on("mouse:down", (opt: any) => {
-        const tool = activeToolRef.current;
-        const pointer = canvas.getPointer(opt.e);
-        if (tool === "panel") { addPanel(canvas, fabric, pointer.x, pointer.y); setActiveTool("select"); }
-        else if (tool === "textbox") { addTextBox(canvas, fabric, pointer.x, pointer.y); setActiveTool("select"); }
-        else if (tool === "balloon") { addSpeechBalloon(canvas, fabric, pointer.x, pointer.y); setActiveTool("select"); }
-        else if (tool === "comment") { setCommentDraft({ x: pointer.x, y: pointer.y }); setActiveTool("select"); }
-      });
-
-      // ── Double-click to edit text objects ─────────────────────────────────
-      canvas.on("mouse:dblclick", (opt: any) => {
-        const target = opt.target;
-        if (!target) return;
-        if (target.type === "textbox") {
-          canvas.setActiveObject(target);
-          target.enterEditing();
-          canvas.renderAll();
-          return;
-        }
-        // Clicking on the balloon shape itself should open its companion text for editing
-        if (target.data?.type === "balloon") {
-          const bLeft = target.left;
-          const bTop = target.top;
-          const companion = canvas.getObjects().find((obj: any) =>
-            obj.data?.type === "balloon-text" &&
-            Math.abs(obj.left - (bLeft + 12)) < 2 &&
-            Math.abs(obj.top - (bTop + 12)) < 2
-          );
-          if (companion) {
-            canvas.setActiveObject(companion);
-            companion.enterEditing();
-            canvas.renderAll();
-          }
-        }
-      });
-
-      // ── Undo history ─────────────────────────────────────────────────────
-      // Debounced so multi-object additions (balloon = 3 objects) become one entry
-      const saveToHistory = debounce(() => {
-        if (isHistoryUpdateRef.current || isRemoteUpdateRef.current) return;
-        const json = JSON.stringify(canvas.toJSON(["data"]));
-        historyRef.current = historyRef.current.slice(0, historyIndexRef.current + 1);
-        historyRef.current.push(json);
-        historyIndexRef.current = historyRef.current.length - 1;
-      }, 100);
-
-      canvas.on("object:added", saveToHistory);
-      canvas.on("object:modified", saveToHistory);
-      canvas.on("object:removed", saveToHistory);
-
-      // ── Selection → properties sidebar ───────────────────────────────────
-      const syncSidebar = () => {
-        const obj = canvas.getActiveObject();
-        if (!obj) {
-          selectedObjectRef.current = null;
-          selectedShapeRef.current = null;
-          setSelectedText(null);
-          setSelectedType(null);
-          return;
-        }
-
-        // Standalone textbox
-        if (obj.type === "textbox" && obj.data?.type !== "balloon-text") {
-          selectedObjectRef.current = obj;
-          selectedShapeRef.current = obj;
-          setSelectedText(String(obj.text ?? ""));
-          setSelectedType("textbox");
-          setSelectedFill(colorToHex(obj.backgroundColor || "#ffffff"));
-          setSelectedStroke("#334155");
-          setSelectedTextColor(colorToHex(obj.fill || "#0f172a"));
-          return;
-        }
-
-        // Balloon text selected directly — find companion shape
-        if (obj.type === "textbox" && obj.data?.type === "balloon-text") {
-          const shape = canvas.getObjects().find((o: any) =>
-            o.data?.type === "balloon" &&
-            Math.abs(o.left - (obj.left - 12)) < 4 &&
-            Math.abs(o.top - (obj.top - 12)) < 4
-          );
-          selectedObjectRef.current = obj;
-          selectedShapeRef.current = shape ?? null;
-          setSelectedText(String(obj.text ?? ""));
-          setSelectedType("balloon");
-          setSelectedFill(colorToHex(shape?.fill || "#ffffff"));
-          setSelectedStroke(colorToHex(shape?.stroke || "#0f172a"));
-          setSelectedTextColor(colorToHex(obj.fill || "#0f172a"));
-          return;
-        }
-
-        // Balloon shape selected — find companion text
-        if (obj.data?.type === "balloon") {
-          const text = canvas.getObjects().find((o: any) =>
-            o.data?.type === "balloon-text" &&
-            Math.abs(o.left - (obj.left + 12)) < 4 &&
-            Math.abs(o.top - (obj.top + 12)) < 4
-          );
-          selectedObjectRef.current = text ?? null;
-          selectedShapeRef.current = obj;
-          setSelectedText(text ? String(text.text ?? "") : null);
-          setSelectedType("balloon");
-          setSelectedFill(colorToHex(obj.fill || "#ffffff"));
-          setSelectedStroke(colorToHex(obj.stroke || "#0f172a"));
-          setSelectedTextColor(colorToHex(text?.fill || "#0f172a"));
-          return;
-        }
-
-        // Panel (info box)
-        if (obj.data?.type === "panel") {
-          selectedObjectRef.current = null;
-          selectedShapeRef.current = obj;
-          setSelectedText(null);
-          setSelectedType("panel");
-          setSelectedFill(colorToHex(obj.fill || "#ffffff"));
-          setSelectedStroke(colorToHex(obj.stroke || "#1e293b"));
-          setSelectedTextColor("#0f172a");
-          return;
-        }
-
-        // Anything else (image, handle, etc.)
-        selectedObjectRef.current = null;
-        selectedShapeRef.current = null;
-        setSelectedText(null);
-        setSelectedType(null);
-      };
-      canvas.on("selection:created", syncSidebar);
-      canvas.on("selection:updated", syncSidebar);
-      canvas.on("selection:cleared", syncSidebar);
-      canvas.on("text:changed", (opt: any) => {
-        if (opt.target === selectedObjectRef.current) {
-          setSelectedText(String(opt.target.text ?? ""));
-        }
-      });
-
-      // ── Clipboard paste ───────────────────────────────────────────────────
-      const handlePaste = (e: ClipboardEvent) => {
-        const items = e.clipboardData?.items;
-        if (!items) return;
-        for (const item of Array.from(items)) {
-          if (item.type.startsWith("image/")) {
-            const blob = item.getAsFile();
-            if (!blob) continue;
-            addImageFromUrl(canvas, fabric, URL.createObjectURL(blob));
-          }
-        }
-      };
-      window.addEventListener("paste", handlePaste);
-
-      // ── Yjs sync (only when NEXT_PUBLIC_PARTYKIT_HOST is set) ─────────────
-      const partykitHost = process.env.NEXT_PUBLIC_PARTYKIT_HOST;
-      const roomId = typeof window !== "undefined"
-        ? (new URLSearchParams(window.location.search).get("room") || "default")
-        : "default";
-
-      if (partykitHost) {
-        setSyncStatus("connecting");
-
-        const [Y, { default: YPartyKitProvider }] = await Promise.all([
-          import("yjs"),
-          import("y-partykit/provider"),
-        ]);
-
-        const doc = new Y.Doc();
-        const yCanvas = doc.getMap<string>("canvas");
-        const yComments = doc.getArray<CommentPin>("comments");
-
-        const provider = new YPartyKitProvider(partykitHost, roomId, doc, {
-          connect: true,
-        });
-
-        provider.on("status", ({ status }: { status: string }) => {
-          setSyncStatus(status === "connected" ? "live" : "connecting");
-        });
-
-        // Assign a random color and name to this user's cursor
-        const myColor = CURSOR_COLORS[Math.floor(Math.random() * CURSOR_COLORS.length)];
-        const myName = `User-${Math.random().toString(36).slice(2, 6)}`;
-        provider.awareness.setLocalStateField("user", { name: myName, color: myColor });
-
-        // Broadcast cursor position
-        canvas.on("mouse:move", (opt: any) => {
-          const pointer = canvas.getPointer(opt.e);
-          provider.awareness.setLocalStateField("cursor", pointer);
-        });
-
-        // Render remote cursors
-        provider.awareness.on("change", () => {
-          const states = provider.awareness.getStates();
-          const cursors: RemoteCursor[] = [];
-          states.forEach((state: any, clientId: number) => {
-            if (clientId === provider.awareness.clientID) return;
-            if (state.cursor && state.user) {
-              cursors.push({ clientId, x: state.cursor.x, y: state.cursor.y, name: state.user.name, color: state.user.color });
-            }
-          });
-          setRemoteCursors(cursors);
-        });
-
-        // Canvas → Yjs (debounced, skip if this was a remote update)
-        const pushToYjs = debounce(() => {
-          if (isRemoteUpdateRef.current) return;
-          const json = JSON.stringify(canvas.toJSON(["data"]));
-          doc.transact(() => { yCanvas.set("json", json); });
-        }, 400);
-
-        canvas.on("object:added", pushToYjs);
-        canvas.on("object:modified", pushToYjs);
-        canvas.on("object:removed", pushToYjs);
-
-        // Yjs → Canvas
-        yCanvas.observe((event) => {
-          if (event.transaction.local) return; // ignore our own changes
-          const json = yCanvas.get("json");
-          if (!json) return;
-          isRemoteUpdateRef.current = true;
-          canvas.loadFromJSON(json, () => {
-            canvas.renderAll();
-            isRemoteUpdateRef.current = false;
-          });
-        });
-
-        // Comments sync: Yjs array → React state
-        yComments.observe(() => {
-          setComments(yComments.toArray());
-        });
-
-        // Override comment setter to write through Yjs
-        (window as any).__yComments = yComments;
-
-        cleanup = () => {
-          provider.destroy();
-          doc.destroy();
-          canvas.dispose();
-          window.removeEventListener("paste", handlePaste);
-        };
-      } else {
-        // No PartyKit host — local-only mode
-        cleanup = () => {
-          canvas.dispose();
-          window.removeEventListener("paste", handlePaste);
-        };
-      }
-    });
-
-    return () => cleanup?.();
+  const pushHistory = useCallback(() => {
+    const snapshot: Page[] = JSON.parse(JSON.stringify(pagesRef.current));
+    historyRef.current = [...historyRef.current.slice(0, historyIdxRef.current + 1), snapshot];
+    historyIdxRef.current = historyRef.current.length - 1;
   }, []);
 
-  // ── Canvas helpers ─────────────────────────────────────────────────────────
+  const undo = useCallback(() => {
+    if (historyIdxRef.current <= 0) return;
+    historyIdxRef.current--;
+    setPages(JSON.parse(JSON.stringify(historyRef.current[historyIdxRef.current])));
+    setSelectedId(null);
+  }, []);
 
-  function addPanel(canvas: any, fabric: any, x: number, y: number) {
-    const rect = new fabric.Rect({
-      left: x, top: y, width: 200, height: 160,
-      fill: "#ffffff", stroke: "#1e293b", strokeWidth: 3,
-      rx: 2, ry: 2, data: { type: "panel" },
+  const redo = useCallback(() => {
+    if (historyIdxRef.current >= historyRef.current.length - 1) return;
+    historyIdxRef.current++;
+    setPages(JSON.parse(JSON.stringify(historyRef.current[historyIdxRef.current])));
+    setSelectedId(null);
+  }, []);
+
+  const [assets, setAssets]         = useState<AssetItem[]>([]);
+  const [rightPanel, setRightPanel] = useState<"assets" | "comments">("assets");
+  const [comments, setComments]     = useState<CommentPin[]>([]);
+
+  // ── Real-time collaboration (Yjs + PartyKit) ──────────────────────────────
+  const [roomId, setRoomId]       = useState<string>("");
+  const [syncStatus, setSyncStatus] = useState<"offline" | "connecting" | "connected">("offline");
+  const ydocRef                   = useRef<Y.Doc | null>(null);
+  const providerRef               = useRef<YPartyKitProvider | null>(null);
+  const applyingRemoteRef         = useRef(false);
+
+  // Initialise room from URL (or generate one and push it)
+  useEffect(() => {
+    const params  = new URLSearchParams(window.location.search);
+    let room      = params.get("room");
+    if (!room) {
+      room = crypto.randomUUID().slice(0, 8);
+      const url = new URL(window.location.href);
+      url.searchParams.set("room", room);
+      window.history.replaceState({}, "", url.toString());
+    }
+    setRoomId(room);
+  }, []);
+
+  // Connect to PartyKit once we have a roomId
+  useEffect(() => {
+    if (!roomId) return;
+    const host = process.env.NEXT_PUBLIC_PARTYKIT_HOST;
+    if (!host) return; // local-only mode — no .env set
+
+    const doc      = new Y.Doc();
+    const provider = new YPartyKitProvider(host, roomId, doc);
+    ydocRef.current    = doc;
+    providerRef.current = provider;
+    setSyncStatus("connecting");
+
+    provider.on("status", ({ status }: { status: string }) => {
+      setSyncStatus(status === "connected" ? "connected" : "connecting");
     });
-    canvas.add(rect);
-    canvas.setActiveObject(rect);
-    canvas.renderAll();
+
+    const ymap = doc.getMap<string>("comic");
+
+    // Remote → local: apply only changes from other peers
+    ymap.observe(() => {
+      if (applyingRemoteRef.current) return;
+      const rawPages    = ymap.get("pages");
+      const rawComments = ymap.get("comments");
+      if (rawPages)    { applyingRemoteRef.current = true; setPages(JSON.parse(rawPages));    applyingRemoteRef.current = false; }
+      if (rawComments) { applyingRemoteRef.current = true; setComments(JSON.parse(rawComments)); applyingRemoteRef.current = false; }
+    });
+
+    return () => {
+      provider.destroy();
+      doc.destroy();
+      ydocRef.current     = null;
+      providerRef.current = null;
+      setSyncStatus("offline");
+    };
+  }, [roomId]);
+
+  // Local → remote: push pages whenever they change
+  useEffect(() => {
+    if (applyingRemoteRef.current) return;
+    const ymap = ydocRef.current?.getMap<string>("comic");
+    if (!ymap) return;
+    ymap.set("pages", JSON.stringify(pages));
+  }, [pages]);
+
+  // Local → remote: push comments whenever they change
+  useEffect(() => {
+    if (applyingRemoteRef.current) return;
+    const ymap = ydocRef.current?.getMap<string>("comic");
+    if (!ymap) return;
+    ymap.set("comments", JSON.stringify(comments));
+  }, [comments]);
+
+  function copyShareLink() {
+    const url = new URL(window.location.href);
+    if (roomId) url.searchParams.set("room", roomId);
+    navigator.clipboard.writeText(url.toString());
   }
 
-  function addTextBox(canvas: any, fabric: any, x: number, y: number) {
-    const tb = new fabric.Textbox("Type here...", {
-      left: x, top: y, width: 180, fontSize: 16,
-      fontFamily: "Bangers, cursive", fill: "#0f172a",
-      backgroundColor: "rgba(255,255,255,0.85)",
-      borderColor: "#3b82f6", padding: 6,
-      data: { type: "textbox" },
-    });
-    canvas.add(tb);
-    canvas.setActiveObject(tb);
-    tb.enterEditing();
-    canvas.renderAll();
-  }
+  const fileInputRef        = useRef<HTMLInputElement>(null);
+  const frameFileInputRef   = useRef<HTMLInputElement>(null);
+  const wordArtBgInputRef   = useRef<HTMLInputElement>(null);
+  const wordArtBgCbRef      = useRef<((url: string) => void) | null>(null);
+  const pendingFrameRef     = useRef<{ pageId: string; frameId: string } | null>(null);
 
-  function addSpeechBalloon(canvas: any, fabric: any, x: number, y: number) {
-    const bw = 180, bh = 90;
-    const tailTipX = bw / 2;
-    const tailTipY = bh + 50;
-
-    const balloon = new fabric.Path(buildBalloonPath(bw, bh, tailTipX, tailTipY), {
-      left: x, top: y, fill: "#ffffff", stroke: "#0f172a", strokeWidth: 2.5,
-      data: { type: "balloon", tailTipX, tailTipY, bw, bh },
-    });
-    const text = new fabric.Textbox("...", {
-      left: x + 12, top: y + 12, width: bw - 24, fontSize: 15,
-      fontFamily: "Bangers, cursive", fill: "#0f172a", textAlign: "center",
-      data: { type: "balloon-text" },
-    });
-    const handle = new fabric.Circle({
-      left: x + tailTipX - 6, top: y + tailTipY - 6,
-      radius: 6, fill: "#3b82f6", stroke: "#1d4ed8", strokeWidth: 1.5,
-      hasControls: false, hasBorders: false,
-      data: { type: "balloon-handle", bw, bh },
-    });
-
-    handle.on("moving", () => {
-      const hx = handle.left! + 6 - balloon.left!;
-      const hy = handle.top! + 6 - balloon.top!;
-      balloon.set({ path: (fabric.util as any).parsePath(buildBalloonPath(bw, bh, hx, hy)) });
-      balloon.setCoords();
-      canvas.renderAll();
-    });
-    balloon.on("moving", () => {
-      handle.set({ left: balloon.left! + tailTipX - 6, top: balloon.top! + tailTipY - 6 });
-      text.set({ left: balloon.left! + 12, top: balloon.top! + 12 });
-      handle.setCoords(); text.setCoords();
-      canvas.renderAll();
-    });
-
-    canvas.add(balloon, text, handle);
-    canvas.setActiveObject(text);
-    text.enterEditing();
-    canvas.renderAll();
-  }
-
-  function addImageFromUrl(canvas: any, fabric: any, url: string) {
-    fabric.Image.fromURL(url, (img: any) => {
-      if (img.width > 300) img.scaleToWidth(300);
-      img.set({ left: 80, top: 80, data: { type: "image" } });
-      canvas.add(img);
-      canvas.setActiveObject(img);
-      canvas.renderAll();
-    }, { crossOrigin: "anonymous" });
-  }
-
-  const handleFileUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleWordArtBgUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file || !fabricRef.current) return;
-    import("fabric").then(({ fabric }) => {
-      addImageFromUrl(fabricRef.current, fabric, URL.createObjectURL(file));
+    if (!file || !wordArtBgCbRef.current) return;
+    const url = URL.createObjectURL(file);
+    wordArtBgCbRef.current(url);
+    wordArtBgCbRef.current = null;
+    e.target.value = "";
+  }, []);
+
+  function openWordArtBgPicker(cb: (url: string) => void) {
+    wordArtBgCbRef.current = cb;
+    wordArtBgInputRef.current?.click();
+  }
+
+  // Pan state
+  const isPanningRef = useRef(false);
+  const panStartRef  = useRef({ x: 0, y: 0, sl: 0, st: 0 });
+
+  // ── Wheel zoom / scroll ───────────────────────────────────────────────────
+  useEffect(() => {
+    const el = mainRef.current;
+    if (!el) return;
+    function onWheel(e: WheelEvent) {
+      e.preventDefault();
+      if (e.ctrlKey) {
+        const prev = zoomRef.current;
+        const next = Math.min(4, Math.max(0.1, prev * Math.exp(-e.deltaY * 0.005)));
+        zoomRef.current = next;
+        setZoom(next);
+      } else {
+        el!.scrollLeft += e.deltaX;
+        el!.scrollTop  += e.deltaY;
+      }
+    }
+    el.addEventListener("wheel", onWheel, { passive: false, capture: true });
+    return () => el.removeEventListener("wheel", onWheel, { capture: true } as EventListenerOptions);
+  }, []);
+
+  function handleZoom(f: number) {
+    setZoom(z => { const n = Math.min(4, Math.max(0.1, z * f)); zoomRef.current = n; return n; });
+  }
+
+  // ── Page helpers ──────────────────────────────────────────────────────────
+  function updatePage(pageId: string, fn: (objs: PageObj[]) => PageObj[]) {
+    setPages(prev => prev.map(p => p.id === pageId ? { ...p, objects: fn(p.objects) } : p));
+  }
+
+  const addObject = useCallback((pageId: string, obj: PageObj) => {
+    pushHistory();
+    updatePage(pageId, objs => [...objs, obj]);
+  }, [pushHistory]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const updateObject = useCallback((pageId: string, id: string, patch: Partial<PageObj>) => {
+    updatePage(pageId, objs => objs.map(o => o.id === id ? { ...o, ...patch } as PageObj : o));
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const deleteObject = useCallback((pageId: string, id: string) => {
+    pushHistory();
+    updatePage(pageId, objs => objs.filter(o => o.id !== id));
+    setSelectedId(null);
+  }, [pushHistory]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Keyboard shortcuts ────────────────────────────────────────────────────
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const el = document.activeElement as HTMLElement;
+      const inInput = el?.tagName === "INPUT" || el?.tagName === "TEXTAREA" || el?.isContentEditable;
+
+      // Undo / redo — always active
+      if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) { e.preventDefault(); undo(); return; }
+      if ((e.ctrlKey || e.metaKey) && (e.key === "y" || (e.key === "z" && e.shiftKey))) { e.preventDefault(); redo(); return; }
+
+      if (inInput) return;
+
+      // Delete selected object
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (selectedId) deleteObject(activePageId, selectedId);
+        return;
+      }
+
+      // Tool shortcuts
+      const toolMap: Record<string, Tool> = { v: "select", h: "pan", f: "frame", t: "text", b: "balloon", n: "narration", w: "wordart", c: "comment" };
+      if (toolMap[e.key.toLowerCase()]) { setTool(toolMap[e.key.toLowerCase()]); return; }
+
+      // Zoom shortcuts
+      if (e.key === "=" || e.key === "+") { handleZoom(1.2); return; }
+      if (e.key === "-") { handleZoom(1 / 1.2); return; }
+      if (e.key === "0") { setZoom(0.8); zoomRef.current = 0.8; return; }
+
+      // Escape to deselect
+      if (e.key === "Escape") { setSelectedId(null); }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedId, activePageId, deleteObject, undo, redo]);
+
+  // ── Asset bank upload ─────────────────────────────────────────────────────
+  const handleAssetUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    Array.from(e.target.files ?? []).forEach(file => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        const tw = 120, th = Math.round(img.height * (120 / img.width));
+        const cv = document.createElement("canvas");
+        cv.width = tw; cv.height = th;
+        cv.getContext("2d")!.drawImage(img, 0, 0, tw, th);
+        setAssets(prev => [...prev, { id: crypto.randomUUID(), name: file.name, url, thumb: cv.toDataURL("image/jpeg", 0.7) }]);
+      };
+      img.src = url;
     });
     e.target.value = "";
   }, []);
 
-  // ── Comments (write through Yjs when live, local otherwise) ───────────────
-  function submitComment() {
-    if (!commentDraft || !commentText.trim()) return;
-    const pin: CommentPin = {
-      id: crypto.randomUUID(), x: commentDraft.x, y: commentDraft.y,
-      text: commentText.trim(), author: "You",
-      createdAt: Date.now(), resolved: false,
-    };
-    const yComments = (window as any).__yComments;
-    if (yComments) {
-      yComments.push([pin]); // Yjs observer will update React state
-    } else {
-      setComments(prev => [...prev, pin]);
-    }
-    setCommentDraft(null);
-    setCommentText("");
+  // ── Frame-specific image upload ───────────────────────────────────────────
+  const handleFrameUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    const pending = pendingFrameRef.current;
+    if (!file || !pending) return;
+    const url = URL.createObjectURL(file);
+    updateObject(pending.pageId, pending.frameId, { imageUrl: url } as Partial<FrameObj>);
+    e.target.value = "";
+    pendingFrameRef.current = null;
+  }, [updateObject]);
+
+  function openFramePicker(pageId: string, frameId: string) {
+    pendingFrameRef.current = { pageId, frameId };
+    frameFileInputRef.current?.click();
   }
 
-  function resolveComment(id: string) {
-    const yComments = (window as any).__yComments;
-    if (yComments) {
-      const idx = (yComments.toArray() as CommentPin[]).findIndex(c => c.id === id);
-      if (idx !== -1) {
-        const pin = yComments.get(idx) as CommentPin;
-        yComments.delete(idx, 1);
-        yComments.insert(idx, [{ ...pin, resolved: true }]);
-      }
-    } else {
-      setComments(prev => prev.map(c => c.id === id ? { ...c, resolved: true } : c));
-    }
+  // ── Pan handlers ──────────────────────────────────────────────────────────
+  function onMainPointerDown(e: React.PointerEvent) {
+    if (toolRef.current !== "pan") return;
+    isPanningRef.current = true;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    panStartRef.current = { x: e.clientX, y: e.clientY, sl: mainRef.current!.scrollLeft, st: mainRef.current!.scrollTop };
+    e.preventDefault();
+  }
+  function onMainPointerMove(e: React.PointerEvent) {
+    if (!isPanningRef.current) return;
+    mainRef.current!.scrollLeft = panStartRef.current.sl - (e.clientX - panStartRef.current.x);
+    mainRef.current!.scrollTop  = panStartRef.current.st - (e.clientY - panStartRef.current.y);
+  }
+  function onMainPointerUp() { isPanningRef.current = false; }
+
+  // ── Spreads ───────────────────────────────────────────────────────────────
+  function getSpreads(): Page[][] {
+    if (!pages.length) return [];
+    const out: Page[][] = [[pages[0]]];
+    for (let i = 1; i < pages.length; i += 2) out.push(pages.slice(i, i + 2));
+    return out;
   }
 
-  // ── Properties sidebar ────────────────────────────────────────────────────
-  function handleSidebarTextChange(value: string) {
-    const canvas = fabricRef.current;
-    const obj = selectedObjectRef.current;
-    if (!obj || !canvas) return;
-    setSelectedText(value);
-    obj.set("text", value);
-    canvas.renderAll();
-    canvas.fire("object:modified", { target: obj });
+  const spreads   = getSpreads();
+  const scaledW   = PAGE_W * zoom;
+  const scaledH   = PAGE_H * zoom;
+  const contentH  = spreads.length * (scaledH + PAGE_GAP) + PADDING * 2;
+  const maxSpreadW = spreads.length > 0
+    ? Math.max(...spreads.map(s => s.length === 1 ? scaledW : scaledW * 2 + 4))
+    : scaledW;
+  const contentW  = maxSpreadW + PADDING * 2;
+
+  const activeComments = comments.filter(c => c.pageId === activePageId && !c.resolved);
+
+  // Derive selected object for the properties panel
+  const activePage = pages.find(p => p.id === activePageId);
+  const selectedPageObj = activePage?.objects.find(o => o.id === selectedId) ?? null;
+  const isColorable = selectedPageObj && (selectedPageObj.kind === "narration" || selectedPageObj.kind === "text" || selectedPageObj.kind === "balloon");
+  const isWordArt = selectedPageObj?.kind === "wordart";
+  const hasBorder = selectedPageObj && (selectedPageObj.kind === "narration" || selectedPageObj.kind === "balloon");
+  function getObjColor(key: "bgColor" | "textColor" | "borderColor", fallback: string): string {
+    if (!selectedPageObj) return fallback;
+    return ((selectedPageObj as unknown) as Record<string, string>)[key] ?? fallback;
+  }
+  function getObjFont(): string {
+    if (!selectedPageObj) return FONTS[0].value;
+    return ((selectedPageObj as unknown) as Record<string, string>)["fontFamily"] ?? FONTS[0].value;
   }
 
-  function handleFillChange(color: string) {
-    const canvas = fabricRef.current;
-    const shape = selectedShapeRef.current;
-    if (!shape || !canvas) return;
-    setSelectedFill(color);
-    shape.set(selectedType === "textbox" ? "backgroundColor" : "fill", color);
-    canvas.renderAll();
-    canvas.fire("object:modified", { target: shape });
-  }
-
-  function handleStrokeChange(color: string) {
-    const canvas = fabricRef.current;
-    const shape = selectedShapeRef.current;
-    if (!shape || !canvas) return;
-    setSelectedStroke(color);
-    shape.set("stroke", color);
-    canvas.renderAll();
-    canvas.fire("object:modified", { target: shape });
-  }
-
-  function handleTextColorChange(color: string) {
-    const canvas = fabricRef.current;
-    const obj = selectedObjectRef.current;
-    if (!obj || !canvas) return;
-    setSelectedTextColor(color);
-    obj.set("fill", color);
-    canvas.renderAll();
-    canvas.fire("object:modified", { target: obj });
-  }
-
-  // ── Zoom / delete ──────────────────────────────────────────────────────────
-  function handleZoom(factor: number) {
-    const canvas = fabricRef.current;
-    if (!canvas) return;
-    const z = Math.min(3, Math.max(0.25, zoom * factor));
-    canvas.setZoom(z);
-    canvas.setWidth(PAGE_W * z);
-    canvas.setHeight(PAGE_H * z);
-    setZoom(z);
-  }
-
-  function deleteSelected() {
-    const canvas = fabricRef.current;
-    if (!canvas) return;
-    canvas.getActiveObjects().forEach((obj: any) => canvas.remove(obj));
-    canvas.discardActiveObject();
-    canvas.renderAll();
-  }
-
-  function undo() {
-    const canvas = fabricRef.current;
-    if (!canvas || historyIndexRef.current <= 0) return;
-    historyIndexRef.current--;
-    isHistoryUpdateRef.current = true;
-    canvas.loadFromJSON(historyRef.current[historyIndexRef.current], () => {
-      canvas.renderAll();
-      isHistoryUpdateRef.current = false;
-    });
-  }
-
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      const tag = (document.activeElement as HTMLElement)?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA") return;
-      if (e.key === "Delete" || e.key === "Backspace") {
-        deleteSelected();
-      }
-      if (e.key === "Escape") setActiveTool("select");
-      if ((e.ctrlKey || e.metaKey) && e.key === "z") {
-        e.preventDefault();
-        undo();
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  const toolCursor: Record<Tool, string> = {
-    select: "default", panel: "crosshair", textbox: "text",
-    balloon: "crosshair", image: "default", comment: "cell",
-  };
-
-  const syncDot = syncStatus === "live" ? "#10b981" : syncStatus === "connecting" ? "#f59e0b" : "#64748b";
-  const syncLabel = syncStatus === "live" ? "Live" : syncStatus === "connecting" ? "Connecting…" : "Local";
-
-  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <>
       {/* eslint-disable-next-line @next/next/no-page-custom-font */}
-      <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bangers&family=Comic+Neue:wght@400;700&display=swap" />
+      <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bangers&family=Comic+Neue:wght@400;700&family=Permanent+Marker&family=Caveat:wght@400;700&family=Anton&family=Oswald:wght@400;700&family=Special+Elite&display=swap" />
       <style suppressHydrationWarning>{`* { box-sizing: border-box; } body { margin: 0; }`}</style>
 
       <div style={{ display: "flex", flexDirection: "column", height: "100vh", background: "#0f172a", color: "#e2e8f0", fontFamily: "Comic Neue, sans-serif" }}>
@@ -609,19 +390,23 @@ export default function ComicEditorClient() {
         {/* Top bar */}
         <header style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 16px", background: "#1e293b", borderBottom: "1px solid #334155", flexShrink: 0 }}>
           <span style={{ fontFamily: "Bangers, cursive", fontSize: 22, letterSpacing: 2, color: "#3b82f6" }}>COMIC FORGE</span>
-          <div style={{ flex: 1 }} />
-
-          {/* Sync indicator */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
-            <span style={{ width: 8, height: 8, borderRadius: "50%", background: syncDot, display: "inline-block", boxShadow: syncStatus === "live" ? `0 0 6px ${syncDot}` : "none" }} />
-            <span style={{ color: syncDot }}>{syncLabel}</span>
-            {syncStatus === "offline" && (
-              <span style={{ color: "#475569", fontSize: 11 }}>— set <code>NEXT_PUBLIC_PARTYKIT_HOST</code> to enable sync</span>
-            )}
-          </div>
-
-          <button onClick={() => setShowComments(v => !v)} style={btnStyle(showComments ? "#059669" : "#334155")}>
-            💬 Comments{comments.filter(c => !c.resolved).length > 0 ? ` (${comments.filter(c => !c.resolved).length})` : ""}
+          <span style={{ flex: 1 }} />
+          {/* Sync status dot */}
+          <span title={syncStatus} style={{
+            width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+            background: syncStatus === "connected" ? "#22c55e" : syncStatus === "connecting" ? "#f59e0b" : "#475569",
+          }} />
+          {syncStatus !== "offline" && (
+            <span style={{ fontSize: 11, color: "#64748b" }}>
+              {syncStatus === "connected" ? "Live" : "Connecting…"}
+            </span>
+          )}
+          <button
+            onClick={copyShareLink}
+            title="Copy share link"
+            style={{ padding: "4px 12px", background: "#1d4ed8", border: "none", borderRadius: 6, color: "#e2e8f0", fontSize: 12, fontFamily: "Bangers, cursive", letterSpacing: 1, cursor: "pointer" }}
+          >
+            Share
           </button>
         </header>
 
@@ -630,154 +415,1267 @@ export default function ComicEditorClient() {
           {/* Left toolbar */}
           <aside style={{ width: 60, background: "#1e293b", borderRight: "1px solid #334155", display: "flex", flexDirection: "column", alignItems: "center", padding: "12px 0", gap: 6, flexShrink: 0 }}>
             {([
-              ["select", "↖", "Select / Move"],
-              ["panel", "⬜", "Add Panel"],
-              ["textbox", "T", "Text Box"],
-              ["balloon", "💬", "Speech Balloon"],
-              ["image", "🖼", "Upload Image"],
-              ["comment", "📌", "Add Comment"],
-            ] as [Tool, string, string][]).map(([tool, icon, label]) => (
-              <button key={tool} title={label}
-                onClick={() => { if (tool === "image") { fileInputRef.current?.click(); return; } setActiveTool(tool); }}
-                style={toolBtnStyle(activeTool === tool)}
-              >{icon}</button>
+              ["select",    "↖",  "Select / Move (V)"],
+              ["pan",       "✋", "Pan (H)"],
+              ["frame",     "⬜", "Draw Frame (F)"],
+              ["text",      "T",  "Text Box (T)"],
+              ["balloon",   "💬", "Speech Balloon (B)"],
+              ["narration", "▭",  "Narration / Caption Box (N)"],
+              ["wordart",   "✦",  "Word Art (W)"],
+              ["comment",   "📌", "Add Comment (C)"],
+            ] as [Tool, string, string][]).map(([t, icon, label]) => (
+              <button key={t} title={label} onClick={() => setTool(t)} style={toolBtnStyle(tool === t)}>{icon}</button>
             ))}
             <div style={{ flex: 1 }} />
-            <button title="Zoom in" onClick={() => handleZoom(1.2)} style={toolBtnStyle(false)}>+</button>
-            <button title="Zoom out" onClick={() => handleZoom(1 / 1.2)} style={toolBtnStyle(false)}>−</button>
-            <button title="Delete selected (Del)" onClick={deleteSelected} style={toolBtnStyle(false, "#ef4444")}>🗑</button>
+            <button title="Undo (Ctrl+Z)" onClick={undo} disabled={historyIdxRef.current <= 0} style={toolBtnStyle(false)}>↩</button>
+            <button title="Redo (Ctrl+Y)" onClick={redo} disabled={historyIdxRef.current >= historyRef.current.length - 1} style={toolBtnStyle(false)}>↪</button>
+            <button title="Add page" onClick={() => { pushHistory(); setPages(p => [...p, { id: `page-${Date.now()}`, objects: [] }]); }} style={toolBtnStyle(false, "#059669")}>+📄</button>
+            <button title="Zoom in"  onClick={() => handleZoom(1.2)}   style={toolBtnStyle(false)}>+</button>
+            <button title="Zoom out" onClick={() => handleZoom(1/1.2)} style={toolBtnStyle(false)}>−</button>
           </aside>
 
-          {/* Canvas area */}
-          <main style={{ flex: 1, overflow: "auto", display: "flex", justifyContent: "center", alignItems: "flex-start", padding: 24, background: "#0f172a" }}>
-            <div style={{ position: "relative", boxShadow: "0 8px 40px rgba(0,0,0,0.6)", cursor: toolCursor[activeTool] }}>
-              <canvas ref={canvasRef} />
-
-              {/* Remote cursors */}
-              {remoteCursors.map(cursor => (
-                <div key={cursor.clientId} style={{ position: "absolute", left: cursor.x * zoom - 6, top: cursor.y * zoom - 6, pointerEvents: "none", zIndex: 80 }}>
-                  <div style={{ width: 12, height: 12, borderRadius: "50% 0 50% 50%", background: cursor.color, transform: "rotate(-45deg)", boxShadow: `0 0 6px ${cursor.color}` }} />
-                  <span style={{ position: "absolute", left: 14, top: -2, background: cursor.color, color: "#fff", fontSize: 10, padding: "1px 5px", borderRadius: 4, whiteSpace: "nowrap" }}>
-                    {cursor.name}
-                  </span>
-                </div>
-              ))}
-
-              {/* Comment pins */}
-              {showComments && comments.map(pin => (
-                <CommentPinMarker key={pin.id} pin={pin} zoom={zoom} onResolve={() => resolveComment(pin.id)} />
-              ))}
-
-              {/* Comment draft input */}
-              {commentDraft && (
-                <div style={{ position: "absolute", left: commentDraft.x * zoom, top: commentDraft.y * zoom, background: "#1e293b", border: "1px solid #3b82f6", borderRadius: 8, padding: 10, zIndex: 100, display: "flex", flexDirection: "column", gap: 6, minWidth: 200 }}>
-                  <textarea autoFocus value={commentText} onChange={e => setCommentText(e.target.value)}
-                    placeholder="Add a comment..." rows={3}
-                    style={{ background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: 6, fontSize: 13, resize: "none", outline: "none" }}
-                    onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitComment(); } if (e.key === "Escape") { setCommentDraft(null); setCommentText(""); } }}
-                  />
-                  <div style={{ display: "flex", gap: 6 }}>
-                    <button onClick={submitComment} style={btnStyle("#3b82f6")}>Post</button>
-                    <button onClick={() => { setCommentDraft(null); setCommentText(""); }} style={btnStyle("#334155")}>Cancel</button>
+          {/* Canvas scroll area */}
+          <main
+            ref={mainRef}
+            style={{ flex: 1, overflow: "auto", background: "#0f172a", cursor: tool === "pan" ? "grab" : "default", position: "relative" }}
+            onPointerDown={onMainPointerDown}
+            onPointerMove={onMainPointerMove}
+            onPointerUp={onMainPointerUp}
+            onPointerLeave={onMainPointerUp}
+          >
+            <div style={{ width: contentW, height: contentH, position: "relative" }}>
+              {spreads.map((spread, si) => {
+                const spreadY = PADDING + si * (scaledH + PAGE_GAP);
+                const spreadW = spread.length === 1 ? scaledW : scaledW * 2 + 4;
+                return (
+                  <div key={si} style={{ position: "absolute", top: spreadY, left: "50%", transform: "translateX(-50%)", display: "flex", gap: spread.length > 1 ? 4 : 0, width: spreadW }}>
+                    {spread.map(page => (
+                      <div key={page.id} style={{ width: scaledW, height: scaledH, flexShrink: 0 }} onClick={() => setActivePageId(page.id)}>
+                        <PageCanvas
+                          page={page}
+                          isActive={page.id === activePageId}
+                          zoom={zoom}
+                          toolRef={toolRef}
+                          selectedId={page.id === activePageId ? selectedId : null}
+                          onSelect={id => { setActivePageId(page.id); setSelectedId(id); }}
+                          onDeselect={() => setSelectedId(null)}
+                          onAddObject={obj => addObject(page.id, obj)}
+                          onUpdateObject={(id, patch) => updateObject(page.id, id, patch)}
+                          onDeleteObject={id => deleteObject(page.id, id)}
+                          onOpenFramePicker={frameId => openFramePicker(page.id, frameId)}
+                          onPushHistory={pushHistory}
+                          comments={comments.filter(c => c.pageId === page.id && !c.resolved)}
+                          onCommentAdd={(x, y, text) => setComments(prev => [...prev, { id: crypto.randomUUID(), pageId: page.id, x, y, text, resolved: false }])}
+                          onCommentResolve={id => setComments(prev => prev.map(c => c.id === id ? { ...c, resolved: true } : c))}
+                        />
+                      </div>
+                    ))}
                   </div>
-                </div>
-              )}
+                );
+              })}
             </div>
           </main>
 
-          {/* Properties panel — always visible */}
-          <aside style={{ width: 220, background: "#1e293b", borderLeft: "1px solid #334155", display: "flex", flexDirection: "column", flexShrink: 0 }}>
-            <div style={{ padding: "12px 16px", borderBottom: "1px solid #334155", fontFamily: "Bangers, cursive", fontSize: 16, letterSpacing: 1, color: "#3b82f6" }}>PROPERTIES</div>
-            <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
-              {selectedType === null ? (
-                <p style={{ color: "#475569", fontSize: 12, margin: 0, lineHeight: 1.5 }}>
-                  Select a text box, speech bubble, or panel to edit its properties.
-                </p>
-              ) : (
-                <>
-                  {/* Text content — textboxes and balloons */}
-                  {(selectedType === "textbox" || selectedType === "balloon") && selectedText !== null && (
-                    <>
-                      <label style={{ fontSize: 11, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 1 }}>Text content</label>
-                      <textarea
-                        value={selectedText}
-                        onChange={e => handleSidebarTextChange(e.target.value)}
-                        rows={4}
-                        style={{ background: "#0f172a", border: "2px solid #3b82f6", color: "#f1f5f9", borderRadius: 6, padding: 10, fontSize: 15, resize: "vertical", outline: "none", fontFamily: "Bangers, cursive", lineHeight: 1.5, width: "100%", boxSizing: "border-box" }}
-                      />
-                    </>
-                  )}
+          {/* Right panel */}
+          <aside style={{ width: 220, background: "#1e293b", borderLeft: "1px solid #334155", display: "flex", flexDirection: "column", overflow: "hidden", flexShrink: 0 }}>
 
-                  {/* Fill / background */}
-                  <ColorRow
-                    label={selectedType === "textbox" ? "Background" : "Fill"}
-                    value={selectedFill}
-                    onChange={handleFillChange}
-                  />
+            {/* Word Art panel */}
+            {isWordArt && selectedPageObj && (
+              <WordArtPanel
+                key={selectedPageObj.id}
+                obj={selectedPageObj as WordArtObj}
+                onUpdate={patch => updateObject(activePageId, selectedPageObj.id, patch as Partial<PageObj>)}
+                onBgImageUpload={cb => openWordArtBgPicker(cb)}
+              />
+            )}
 
-                  {/* Border — balloons and panels only */}
-                  {(selectedType === "balloon" || selectedType === "panel") && (
-                    <ColorRow label="Border" value={selectedStroke} onChange={handleStrokeChange} />
-                  )}
+            {/* Text content editor */}
+            {isColorable && selectedPageObj && (
+              <div style={{ padding: "10px 12px", borderBottom: "1px solid #334155", flexShrink: 0 }}>
+                <TextContentEditor
+                  key={selectedPageObj.id}
+                  id={selectedPageObj.id}
+                  content={(selectedPageObj as { content: string }).content}
+                  fontFamily={getObjFont()}
+                  fontSize={((selectedPageObj as unknown as Record<string, number>).fontSize) ?? 16}
+                  textColor={getObjColor("textColor", "#0f172a")}
+                  onContentChange={html => updateObject(activePageId, selectedPageObj.id, { content: html } as Partial<PageObj>)}
+                  onFontSizeChange={size => updateObject(activePageId, selectedPageObj.id, { fontSize: size } as unknown as Partial<PageObj>)}
+                />
+              </div>
+            )}
 
-                  {/* Text color — textboxes and balloons */}
-                  {(selectedType === "textbox" || selectedType === "balloon") && (
-                    <ColorRow label="Text color" value={selectedTextColor} onChange={handleTextColorChange} />
-                  )}
-                </>
-              )}
+            {/* Properties inspector */}
+            {isColorable && (
+              <div style={{ padding: "10px 12px", borderBottom: "1px solid #334155", flexShrink: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+                <span style={{ fontSize: 10, color: "#64748b", fontFamily: "Bangers, cursive", letterSpacing: 1, textTransform: "uppercase" }}>Properties</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 12, color: "#94a3b8", flex: 1 }}>Background</span>
+                  <input type="color" value={getObjColor("bgColor", "#ffffff")}
+                    onMouseDown={pushHistory}
+                    onChange={e => updateObject(activePageId, selectedPageObj!.id, { bgColor: e.target.value } as Partial<PageObj>)}
+                    style={{ width: 32, height: 26, border: "1px solid #334155", borderRadius: 4, padding: 1, cursor: "pointer", background: "none" }} />
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 12, color: "#94a3b8", flex: 1 }}>Text color</span>
+                  <input type="color" value={getObjColor("textColor", "#0f172a")}
+                    onMouseDown={pushHistory}
+                    onChange={e => updateObject(activePageId, selectedPageObj!.id, { textColor: e.target.value } as Partial<PageObj>)}
+                    style={{ width: 32, height: 26, border: "1px solid #334155", borderRadius: 4, padding: 1, cursor: "pointer", background: "none" }} />
+                </div>
+                {hasBorder && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 12, color: "#94a3b8", flex: 1 }}>Border color</span>
+                    <input type="color" value={getObjColor("borderColor", "#1e293b")}
+                      onMouseDown={pushHistory}
+                      onChange={e => updateObject(activePageId, selectedPageObj!.id, { borderColor: e.target.value } as Partial<PageObj>)}
+                      style={{ width: 32, height: 26, border: "1px solid #334155", borderRadius: 4, padding: 1, cursor: "pointer", background: "none" }} />
+                  </div>
+                )}
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <span style={{ fontSize: 12, color: "#94a3b8" }}>Font</span>
+                  <select
+                    value={getObjFont()}
+                    onMouseDown={pushHistory}
+                    onChange={e => updateObject(activePageId, selectedPageObj!.id, { fontFamily: e.target.value } as Partial<PageObj>)}
+                    style={{ background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: "4px 6px", fontSize: 12, cursor: "pointer", width: "100%" }}
+                  >
+                    {FONTS.map(f => (
+                      <option key={f.value} value={f.value}>{f.label}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            )}
+
+            <div style={{ display: "flex", borderBottom: "1px solid #334155", flexShrink: 0 }}>
+              {(["assets", "comments"] as const).map(tab => (
+                <button key={tab} onClick={() => setRightPanel(tab)} style={{
+                  flex: 1, padding: "8px 4px", background: "none", border: "none",
+                  borderBottom: rightPanel === tab ? "2px solid #3b82f6" : "2px solid transparent",
+                  color: rightPanel === tab ? "#e2e8f0" : "#64748b",
+                  fontFamily: "Bangers, cursive", fontSize: 13, letterSpacing: 1, cursor: "pointer",
+                  textTransform: "uppercase",
+                }}>
+                  {tab === "assets" ? `🖼 Assets${assets.length ? ` (${assets.length})` : ""}` : `💬 Notes${activeComments.length ? ` (${activeComments.length})` : ""}`}
+                </button>
+              ))}
             </div>
-          </aside>
 
-          {/* Comments panel */}
-          {showComments && (
-            <aside style={{ width: 260, background: "#1e293b", borderLeft: "1px solid #334155", display: "flex", flexDirection: "column", overflow: "hidden", flexShrink: 0 }}>
-              <div style={{ padding: "12px 16px", borderBottom: "1px solid #334155", fontFamily: "Bangers, cursive", fontSize: 16, letterSpacing: 1, color: "#10b981" }}>COMMENTS</div>
-              <div style={{ flex: 1, overflowY: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
-                {comments.length === 0 && (
-                  <p style={{ color: "#64748b", fontSize: 13, textAlign: "center", marginTop: 20 }}>
-                    Click the 📌 tool then click on the canvas to add a comment.
+            {rightPanel === "assets" && (
+              <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column" }}>
+                <button onClick={() => fileInputRef.current?.click()} style={{ margin: 10, padding: 8, background: "#0f172a", border: "1px dashed #334155", borderRadius: 8, color: "#64748b", cursor: "pointer", fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                  + Upload images
+                </button>
+                {assets.length === 0 && (
+                  <p style={{ color: "#475569", fontSize: 12, textAlign: "center", padding: "0 12px" }}>
+                    Upload images then drag them onto a frame, or click a frame to upload directly.
                   </p>
                 )}
-                {comments.map(pin => (
-                  <div key={pin.id} style={{ background: "#0f172a", border: `1px solid ${pin.resolved ? "#334155" : "#3b82f6"}`, borderRadius: 8, padding: 10, opacity: pin.resolved ? 0.5 : 1 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, padding: "0 10px 10px" }}>
+                  {assets.map(asset => (
+                    <div key={asset.id} style={{ position: "relative", borderRadius: 6, overflow: "hidden", border: "1px solid #334155", background: "#0f172a" }}>
+                      <img
+                        src={asset.thumb} alt={asset.name} draggable
+                        onDragStart={e => e.dataTransfer.setData("assetUrl", asset.url)}
+                        style={{ width: "100%", display: "block", aspectRatio: "1", objectFit: "cover", cursor: "grab" }}
+                      />
+                      <div style={{ padding: "4px 6px", display: "flex", alignItems: "center", gap: 2 }}>
+                        <span style={{ fontSize: 10, color: "#94a3b8", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }} title={asset.name}>{asset.name}</span>
+                        <button onClick={() => setAssets(prev => prev.filter(a => a.id !== asset.id))} style={{ background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 12, padding: "0 2px" }}>×</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {rightPanel === "comments" && (
+              <div style={{ flex: 1, overflowY: "auto", padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+                {activeComments.length === 0 && (
+                  <p style={{ color: "#64748b", fontSize: 13, textAlign: "center", marginTop: 20 }}>Click 📌 then click the page to pin a note.</p>
+                )}
+                {activeComments.map(pin => (
+                  <div key={pin.id} style={{ background: "#0f172a", border: "1px solid #3b82f6", borderRadius: 8, padding: 10 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                      <span style={{ fontSize: 11, color: "#10b981", fontWeight: 700 }}>{pin.author}</span>
-                      {!pin.resolved && (
-                        <button onClick={() => resolveComment(pin.id)} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 11, padding: 0 }}>✓ Resolve</button>
-                      )}
+                      <span style={{ fontSize: 11, color: "#10b981", fontWeight: 700 }}>You</span>
+                      <button onClick={() => setComments(prev => prev.map(c => c.id === pin.id ? { ...c, resolved: true } : c))} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 11, padding: 0 }}>✓</button>
                     </div>
                     <p style={{ margin: 0, fontSize: 13, color: "#e2e8f0", lineHeight: 1.4 }}>{pin.text}</p>
                   </div>
                 ))}
               </div>
-            </aside>
-          )}
+            )}
+          </aside>
         </div>
 
         {/* Status bar */}
         <footer style={{ background: "#1e293b", borderTop: "1px solid #334155", padding: "4px 16px", display: "flex", gap: 16, fontSize: 11, color: "#64748b", flexShrink: 0 }}>
-          <span>Tool: <strong style={{ color: "#3b82f6" }}>{activeTool}</strong></span>
+          <span>Tool: <strong style={{ color: "#3b82f6" }}>{tool}</strong></span>
           <span>Zoom: <strong style={{ color: "#10b981" }}>{Math.round(zoom * 100)}%</strong></span>
-          <span>Page: <strong style={{ color: "#94a3b8" }}>8.5 × 11 in</strong></span>
-          <span style={{ flex: 1 }} />
-          <span>Font: <strong style={{ color: "#94a3b8", fontFamily: "Bangers, cursive" }}>Bangers</strong> (SIL OFL 1.1) + Comic Neue</span>
+          <span>Pages: <strong style={{ color: "#94a3b8" }}>{pages.length}</strong></span>
+          <span style={{ color: "#475569" }}>Draw frame → drop or click to add image</span>
+          <span style={{ color: "#475569", marginLeft: "auto" }}>V·H·F·T·B·N·C = tools &nbsp;|&nbsp; Ctrl+Z/Y = undo/redo &nbsp;|&nbsp; +/− = zoom &nbsp;|&nbsp; Del = delete</span>
         </footer>
       </div>
 
-      <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleFileUpload} />
+      <input ref={fileInputRef}        type="file" accept="image/*" multiple style={{ display: "none" }} onChange={handleAssetUpload} />
+      <input ref={frameFileInputRef}   type="file" accept="image/*"          style={{ display: "none" }} onChange={handleFrameUpload} />
+      <input ref={wordArtBgInputRef}   type="file" accept="image/*"          style={{ display: "none" }} onChange={handleWordArtBgUpload} />
     </>
   );
 }
 
-// ── Comment pin marker ─────────────────────────────────────────────────────
+// ── PageCanvas ────────────────────────────────────────────────────────────────
 
-function CommentPinMarker({ pin, zoom, onResolve }: { pin: CommentPin; zoom: number; onResolve: () => void }) {
-  const [open, setOpen] = useState(false);
-  if (pin.resolved) return null;
+interface PageCanvasProps {
+  page: Page;
+  isActive: boolean;
+  zoom: number;
+  toolRef: React.MutableRefObject<Tool>;
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+  onDeselect: () => void;
+  onAddObject: (obj: PageObj) => void;
+  onUpdateObject: (id: string, patch: Partial<PageObj>) => void;
+  onDeleteObject: (id: string) => void;
+  onOpenFramePicker: (frameId: string) => void;
+  onPushHistory: () => void;
+  comments: CommentPin[];
+  onCommentAdd: (x: number, y: number, text: string) => void;
+  onCommentResolve: (id: string) => void;
+}
+
+type DrawPreview = { x: number; y: number; w: number; h: number };
+type MoveState   = { id: string; startObjX: number; startObjY: number; startMX: number; startMY: number };
+type ResizeState = { id: string; handle: string; origX: number; origY: number; origW: number; origH: number; startMX: number; startMY: number };
+
+function PageCanvas({
+  page, isActive, zoom, toolRef,
+  selectedId, onSelect, onDeselect,
+  onAddObject, onUpdateObject, onDeleteObject,
+  onOpenFramePicker, onPushHistory, comments, onCommentAdd, onCommentResolve,
+}: PageCanvasProps) {
+  const pageRef    = useRef<HTMLDivElement>(null);
+  const [drawing, setDrawing]         = useState<DrawPreview | null>(null);
+  const drawStartRef  = useRef<{ x: number; y: number } | null>(null);
+  const moveStateRef  = useRef<MoveState | null>(null);
+  const resizeStateRef = useRef<ResizeState | null>(null);
+  const [editingId, setEditingId]     = useState<string | null>(null); // kept for sidebar focus
+  const [commentDraft, setCommentDraft] = useState<{ x: number; y: number } | null>(null);
+  const [commentText, setCommentText]   = useState("");
+  const [pendingStemId, setPendingStemId] = useState<string | null>(null);
+  const [stemPreviewTip, setStemPreviewTip] = useState<{ x: number; y: number } | null>(null);
+  const stemDragRef = useRef<{ id: string; scx: number; scy: number } | null>(null);
+  const stemBendDragRef = useRef<{ id: string; ang: number; origBend: number; startMX: number; startMY: number } | null>(null);
+  const stemOriginDragRef = useRef<{ id: string; cx: number; cy: number } | null>(null);
+  const [shiftSelectedId, setShiftSelectedId] = useState<string | null>(null);
+
+  function pagePoint(e: React.PointerEvent): { x: number; y: number } {
+    const rect = pageRef.current!.getBoundingClientRect();
+    return { x: (e.clientX - rect.left) / zoom, y: (e.clientY - rect.top) / zoom };
+  }
+
+  function hitTest(px: number, py: number): PageObj | null {
+    for (let i = page.objects.length - 1; i >= 0; i--) {
+      const o = page.objects[i];
+      if (px >= o.x && px <= o.x + o.w && py >= o.y && py <= o.y + o.h) return o;
+    }
+    return null;
+  }
+
+  function onPointerDown(e: React.PointerEvent) {
+    if (e.button !== 0) return;
+    const tag = (e.target as HTMLElement).tagName;
+    if (tag === "BUTTON" || tag === "TEXTAREA" || (e.target as HTMLElement).isContentEditable) return;
+
+    const t = toolRef.current;
+    if (t === "pan") return;
+
+    const p = pagePoint(e);
+
+    // Phase 2: place stem tip after drawing balloon
+    if (pendingStemId) {
+      const src = page.objects.find(o => o.id === pendingStemId) as BalloonObj | undefined;
+      if (src) {
+        const scx = src.x + src.w / 2, scy = src.y + src.h / 2;
+        const targetBalloon = page.objects.find(o =>
+          o.kind === "balloon" && o.id !== pendingStemId &&
+          p.x >= o.x && p.x <= o.x + o.w && p.y >= o.y && p.y <= o.y + o.h
+        ) as BalloonObj | undefined;
+        if (targetBalloon) {
+          onUpdateObject(pendingStemId, { stemDx: 0, stemDy: 0, stemTargetId: targetBalloon.id } as Partial<BalloonObj>);
+        } else {
+          onUpdateObject(pendingStemId, { stemDx: p.x - scx, stemDy: p.y - scy } as Partial<BalloonObj>);
+        }
+      }
+      setPendingStemId(null);
+      setStemPreviewTip(null);
+      return;
+    }
+
+    if (t === "comment") {
+      setCommentDraft(p);
+      return;
+    }
+
+    if (t === "select") {
+      const hit = hitTest(p.x, p.y);
+      if (hit) {
+        if (e.shiftKey && selectedId && selectedId !== hit.id) {
+          // Shift+click: set second selection for merge
+          setShiftSelectedId(hit.id);
+        } else {
+          onSelect(hit.id);
+          setShiftSelectedId(null);
+          onPushHistory();
+          moveStateRef.current = { id: hit.id, startObjX: hit.x, startObjY: hit.y, startMX: p.x, startMY: p.y };
+          pageRef.current!.setPointerCapture(e.pointerId);
+        }
+      } else {
+        onDeselect();
+        setShiftSelectedId(null);
+        setEditingId(null);
+      }
+      return;
+    }
+
+    // Drawing tools
+    drawStartRef.current = p;
+    setDrawing({ x: p.x, y: p.y, w: 0, h: 0 });
+    pageRef.current!.setPointerCapture(e.pointerId);
+  }
+
+  function onPointerMove(e: React.PointerEvent) {
+    const p = pagePoint(e);
+
+    if (pendingStemId) {
+      setStemPreviewTip(p);
+      return;
+    }
+
+    if (stemDragRef.current) {
+      const { id, scx, scy } = stemDragRef.current;
+      const target = page.objects.find(o =>
+        o.kind === "balloon" && o.id !== id &&
+        p.x >= o.x && p.x <= o.x + o.w && p.y >= o.y && p.y <= o.y + o.h
+      ) as BalloonObj | undefined;
+      if (target) {
+        onUpdateObject(id, { stemDx: 0, stemDy: 0, stemTargetId: target.id } as Partial<BalloonObj>);
+      } else {
+        onUpdateObject(id, { stemDx: p.x - scx, stemDy: p.y - scy, stemTargetId: undefined } as Partial<BalloonObj>);
+      }
+      return;
+    }
+
+    if (stemBendDragRef.current) {
+      const { id, ang, origBend, startMX, startMY } = stemBendDragRef.current;
+      const dx = p.x - startMX, dy = p.y - startMY;
+      const perpX = Math.cos(ang + Math.PI / 2), perpY = Math.sin(ang + Math.PI / 2);
+      onUpdateObject(id, { stemBend: origBend + dx * perpX + dy * perpY } as Partial<BalloonObj>);
+      return;
+    }
+
+    if (stemOriginDragRef.current) {
+      const { id, cx, cy } = stemOriginDragRef.current;
+      onUpdateObject(id, { stemOriginAng: Math.atan2(p.y - cy, p.x - cx) } as Partial<BalloonObj>);
+      return;
+    }
+
+    if (moveStateRef.current) {
+      const { id, startObjX, startObjY, startMX, startMY } = moveStateRef.current;
+      onUpdateObject(id, { x: startObjX + p.x - startMX, y: startObjY + p.y - startMY } as Partial<PageObj>);
+      return;
+    }
+
+    if (resizeStateRef.current) {
+      const { id, handle, origX, origY, origW, origH, startMX, startMY } = resizeStateRef.current;
+      const dx = p.x - startMX, dy = p.y - startMY;
+      let { x, y, w, h } = { x: origX, y: origY, w: origW, h: origH };
+      if (handle.includes("e")) w = Math.max(20, origW + dx);
+      if (handle.includes("s")) h = Math.max(20, origH + dy);
+      if (handle.includes("w")) { x = origX + dx; w = Math.max(20, origW - dx); }
+      if (handle.includes("n")) { y = origY + dy; h = Math.max(20, origH - dy); }
+      onUpdateObject(id, { x, y, w, h } as Partial<PageObj>);
+      return;
+    }
+
+    if (drawStartRef.current) {
+      const dx = p.x - drawStartRef.current.x;
+      const dy = p.y - drawStartRef.current.y;
+      setDrawing({
+        x: dx < 0 ? p.x : drawStartRef.current.x,
+        y: dy < 0 ? p.y : drawStartRef.current.y,
+        w: Math.abs(dx), h: Math.abs(dy),
+      });
+    }
+  }
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape" && pendingStemId) {
+        setPendingStemId(null);
+        setStemPreviewTip(null);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pendingStemId]);
+
+  function startStemDrag(balloonId: string, e: React.PointerEvent) {
+    e.stopPropagation();
+    const obj = page.objects.find(o => o.id === balloonId) as BalloonObj | undefined;
+    if (!obj) return;
+    onPushHistory();
+    stemDragRef.current = { id: balloonId, scx: obj.x + obj.w / 2, scy: obj.y + obj.h / 2 };
+    pageRef.current!.setPointerCapture(e.pointerId);
+  }
+
+  function startStemBendDrag(balloonId: string, ang: number, e: React.PointerEvent) {
+    e.stopPropagation();
+    const obj = page.objects.find(o => o.id === balloonId) as BalloonObj | undefined;
+    if (!obj) return;
+    const p = pagePoint(e);
+    stemBendDragRef.current = { id: balloonId, ang, origBend: obj.stemBend, startMX: p.x, startMY: p.y };
+    pageRef.current!.setPointerCapture(e.pointerId);
+  }
+
+  function startStemOriginDrag(balloonId: string, e: React.PointerEvent) {
+    e.stopPropagation();
+    const obj = page.objects.find(o => o.id === balloonId) as BalloonObj | undefined;
+    if (!obj) return;
+    stemOriginDragRef.current = { id: balloonId, cx: obj.x + obj.w / 2, cy: obj.y + obj.h / 2 };
+    pageRef.current!.setPointerCapture(e.pointerId);
+  }
+
+  function onPointerUp(e: React.PointerEvent) {
+    stemDragRef.current = null;
+    stemBendDragRef.current = null;
+    stemOriginDragRef.current = null;
+    moveStateRef.current = null;
+    resizeStateRef.current = null;
+
+    if (drawStartRef.current && drawing) {
+      const t = toolRef.current;
+      if (drawing.w > 15 && drawing.h > 15) {
+        const id = crypto.randomUUID();
+        if (t === "frame") {
+          onAddObject({ id, kind: "frame", ...drawing });
+          onSelect(id);
+        } else if (t === "text") {
+          onAddObject({ id, kind: "text", ...drawing, content: "Type here…" });
+          onSelect(id);
+          setEditingId(id);
+        } else if (t === "balloon") {
+          const stemDy = drawing.h / 2 + 40;
+          onAddObject({ id, kind: "balloon", ...drawing, content: "…", stemDx: 0, stemDy, stemBend: 0 });
+          onSelect(id);
+          setPendingStemId(id);
+          setStemPreviewTip({ x: drawing.x + drawing.w / 2, y: drawing.y + drawing.h / 2 + stemDy });
+        } else if (t === "narration") {
+          onAddObject({ id, kind: "narration", ...drawing, content: "Narrator text…", bgColor: "#fef9c3", textColor: "#1e293b" });
+          onSelect(id);
+          setEditingId(id);
+        } else if (t === "wordart") {
+          onAddObject({
+            id, kind: "wordart", ...drawing,
+            content: "WORD ART",
+            fontFamily: "Bangers, cursive",
+            fontSize: 52,
+            textColor: "#ff6b35",
+            textGradient: null,
+            bg: { type: "none" },
+            curve: 25,
+            outline: { color: "#1e293b", width: 4 },
+            shadow: null,
+          });
+          onSelect(id);
+        }
+      }
+      drawStartRef.current = null;
+      setDrawing(null);
+    }
+  }
+
+  function onDrop(e: React.DragEvent) {
+    e.preventDefault();
+    const url = e.dataTransfer.getData("assetUrl");
+    if (!url) return;
+    const rect = pageRef.current!.getBoundingClientRect();
+    const px = (e.clientX - rect.left) / zoom;
+    const py = (e.clientY - rect.top)  / zoom;
+    const frame = page.objects.find(
+      o => o.kind === "frame" && px >= o.x && px <= o.x + o.w && py >= o.y && py <= o.y + o.h
+    ) as FrameObj | undefined;
+    if (frame) {
+      onUpdateObject(frame.id, { imageUrl: url } as Partial<FrameObj>);
+    } else {
+      // Create a new frame at the drop point filled with the image
+      const id = crypto.randomUUID();
+      onAddObject({ id, kind: "frame", x: px - 100, y: py - 75, w: 200, h: 150, imageUrl: url });
+      onSelect(id);
+    }
+  }
+
+  function startResize(id: string, handle: string, e: React.PointerEvent) {
+    e.stopPropagation();
+    const obj = page.objects.find(o => o.id === id);
+    if (!obj) return;
+    onPushHistory();
+    const p = pagePoint(e);
+    resizeStateRef.current = { id, handle, origX: obj.x, origY: obj.y, origW: obj.w, origH: obj.h, startMX: p.x, startMY: p.y };
+    pageRef.current!.setPointerCapture(e.pointerId);
+  }
+
+  const selectedObj = selectedId ? page.objects.find(o => o.id === selectedId) : null;
+
+  const drawCursor: Record<Tool, string> = {
+    select: "default", pan: "grab",
+    frame: "crosshair", text: "crosshair", balloon: "crosshair", narration: "crosshair", wordart: "crosshair", comment: "cell",
+  };
+
+  function submitComment() {
+    if (!commentDraft || !commentText.trim()) return;
+    onCommentAdd(commentDraft.x, commentDraft.y, commentText.trim());
+    setCommentDraft(null);
+    setCommentText("");
+  }
+
   return (
-    <div style={{ position: "absolute", left: pin.x * zoom - 10, top: pin.y * zoom - 10, zIndex: 50 }}>
-      <div onClick={() => setOpen(v => !v)} style={{ width: 20, height: 20, borderRadius: "50% 50% 50% 0", background: "#3b82f6", border: "2px solid #1d4ed8", cursor: "pointer", transform: "rotate(-45deg)", boxShadow: "0 2px 8px rgba(59,130,246,0.5)" }} />
+    // Outer shell — allocates scaled space, clips the page
+    <div style={{ width: PAGE_W * zoom, height: PAGE_H * zoom, overflow: "hidden", boxShadow: "0 8px 40px rgba(0,0,0,0.6)", outline: isActive ? "2px solid #3b82f6" : "2px solid #334155", outlineOffset: 2, position: "relative" }}>
+      {/* Page div — PAGE_W × PAGE_H, scaled with CSS */}
+      <div
+        ref={pageRef}
+        style={{
+          width: PAGE_W, height: PAGE_H,
+          position: "absolute", top: 0, left: 0,
+          transform: `scale(${zoom})`, transformOrigin: "top left",
+          background: "#ffffff",
+          cursor: drawCursor[toolRef.current] ?? "default",
+          userSelect: "none",
+        }}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onDoubleClick={e => {
+          if (toolRef.current !== "select") return;
+          const rect = pageRef.current!.getBoundingClientRect();
+          const px = (e.clientX - rect.left) / zoom, py = (e.clientY - rect.top) / zoom;
+          const hit = hitTest(px, py);
+          if (hit && (hit.kind === "balloon" || hit.kind === "text" || hit.kind === "narration")) setEditingId(hit.id);
+        }}
+        onDragOver={e => e.preventDefault()}
+        onDrop={onDrop}
+      >
+        {/* Objects — balloon sources render after their targets so fill covers correctly */}
+        {(() => {
+          const allBalloons = page.objects.filter(o => o.kind === "balloon") as BalloonObj[];
+          const sorted = [...page.objects].sort((a, b) => {
+            if (a.kind === "balloon" && b.kind === "balloon") {
+              if ((a as BalloonObj).stemTargetId === b.id) return 1;
+              if ((b as BalloonObj).stemTargetId === a.id) return -1;
+            }
+            return 0;
+          });
+          // Track balloons already rendered as compound partner (skip them)
+          const renderedAsPartner = new Set<string>();
+          return sorted.map(obj => {
+            if (renderedAsPartner.has(obj.id)) return null;
+            const isSel = obj.id === selectedId;
+            if (obj.kind === "frame") return (
+              <FrameRenderer key={obj.id} frame={obj} isSelected={isSel} onOpenPicker={() => onOpenFramePicker(obj.id)} />
+            );
+            if (obj.kind === "text") return (
+              <TextRenderer key={obj.id} obj={obj} isSelected={isSel} />
+            );
+            if (obj.kind === "narration") return (
+              <NarrationRenderer key={obj.id} obj={obj} isSelected={isSel} />
+            );
+            if (obj.kind === "wordart") return (
+              <WordArtRenderer key={obj.id} obj={obj} isSelected={isSel} />
+            );
+            if (obj.kind === "balloon") {
+              const balloon = obj as BalloonObj;
+              const incomingConnections = allBalloons.filter(b => b.stemTargetId === obj.id);
+              // Find merged partner (if any), mark partner as rendered
+              let mergedPartner: BalloonObj | undefined;
+              if (balloon.mergedPairId) {
+                mergedPartner = allBalloons.find(b => b.id === balloon.mergedPairId && b.mergedPairId === balloon.id);
+                if (mergedPartner) renderedAsPartner.add(mergedPartner.id);
+              }
+              return (
+                <BalloonRenderer key={obj.id} obj={balloon} allBalloons={allBalloons} isSelected={isSel}
+                  incomingConnections={incomingConnections}
+                  mergedPartner={mergedPartner}
+                  onStemDragStart={e => startStemDrag(obj.id, e)}
+                  onStemBendDragStart={(ang, e) => startStemBendDrag(obj.id, ang, e)}
+                  onStemOriginDragStart={e => startStemOriginDrag(obj.id, e)} />
+              );
+            }
+            return null;
+          });
+        })()}
+
+        {/* Draw preview */}
+        {drawing && drawing.w > 2 && drawing.h > 2 && (
+          toolRef.current === "balloon" ? (
+            <svg style={{ position: "absolute", left: 0, top: 0, width: PAGE_W, height: PAGE_H, pointerEvents: "none", overflow: "visible" }}>
+              <ellipse cx={drawing.x + drawing.w / 2} cy={drawing.y + drawing.h / 2} rx={drawing.w / 2} ry={drawing.h / 2}
+                fill="rgba(59,130,246,0.06)" stroke="#3b82f6" strokeWidth={2} strokeDasharray="6,3" />
+            </svg>
+          ) : (
+            <div style={{ position: "absolute", left: drawing.x, top: drawing.y, width: drawing.w, height: drawing.h, border: "2px dashed #3b82f6", background: "rgba(59,130,246,0.06)", pointerEvents: "none" }} />
+          )
+        )}
+
+        {/* Stem placement preview */}
+        {pendingStemId && stemPreviewTip && (() => {
+          const src = page.objects.find(o => o.id === pendingStemId) as BalloonObj | undefined;
+          if (!src) return null;
+          const scx = src.x + src.w / 2, scy = src.y + src.h / 2;
+          const ang = Math.atan2(stemPreviewTip.y - scy, stemPreviewTip.x - scx);
+          const ex = scx + (src.w / 2) * Math.cos(ang), ey = scy + (src.h / 2) * Math.sin(ang);
+          const isOverBalloon = page.objects.some(o =>
+            o.kind === "balloon" && o.id !== pendingStemId &&
+            stemPreviewTip.x >= o.x && stemPreviewTip.x <= o.x + o.w &&
+            stemPreviewTip.y >= o.y && stemPreviewTip.y <= o.y + o.h
+          );
+          return (
+            <svg style={{ position: "absolute", left: 0, top: 0, width: PAGE_W, height: PAGE_H, pointerEvents: "none", overflow: "visible", zIndex: 90 }}>
+              <line x1={ex} y1={ey} x2={stemPreviewTip.x} y2={stemPreviewTip.y} stroke="#3b82f6" strokeWidth={2} strokeDasharray="5,3" />
+              <circle cx={stemPreviewTip.x} cy={stemPreviewTip.y} r={5} fill={isOverBalloon ? "#10b981" : "#3b82f6"} />
+            </svg>
+          );
+        })()}
+
+        {/* Stem placement hint */}
+        {pendingStemId && (
+          <div style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", background: "#1d4ed8", color: "#fff", fontSize: 12, padding: "4px 12px", borderRadius: 20, pointerEvents: "none", zIndex: 100, whiteSpace: "nowrap", fontFamily: "Comic Neue, sans-serif" }}>
+            Click to place stem tip — click another bubble to connect
+          </div>
+        )}
+
+        {/* Selection handles */}
+        {selectedObj && (
+          <SelectionHandles obj={selectedObj} onStartResize={(handle, e) => startResize(selectedObj.id, handle, e)} />
+        )}
+
+        {/* Merge / unmerge controls */}
+        {(() => {
+          const selBalloon = selectedId ? page.objects.find(o => o.id === selectedId && o.kind === "balloon") as BalloonObj | undefined : undefined;
+          const shiftBalloon = shiftSelectedId ? page.objects.find(o => o.id === shiftSelectedId && o.kind === "balloon") as BalloonObj | undefined : undefined;
+
+          // Two balloons shift-selected → offer merge
+          if (selBalloon && shiftBalloon) {
+            const midX = (selBalloon.x + selBalloon.w / 2 + shiftBalloon.x + shiftBalloon.w / 2) / 2;
+            const midY = Math.min(selBalloon.y, shiftBalloon.y) - 36;
+            const alreadyMerged = selBalloon.mergedPairId === shiftBalloon.id;
+            return (
+              <div style={{ position: "absolute", left: midX - 44, top: midY, zIndex: 200, display: "flex", gap: 6 }}>
+                {alreadyMerged ? (
+                  <button
+                    style={btnStyle("#ef4444")}
+                    onPointerDown={e => e.stopPropagation()}
+                    onClick={e => {
+                      e.stopPropagation();
+                      onUpdateObject(selBalloon.id, { mergedPairId: undefined } as Partial<BalloonObj>);
+                      onUpdateObject(shiftBalloon.id, { mergedPairId: undefined } as Partial<BalloonObj>);
+                      setShiftSelectedId(null);
+                    }}
+                  >⊘ Unmerge</button>
+                ) : (
+                  <button
+                    style={btnStyle("#7c3aed")}
+                    onPointerDown={e => e.stopPropagation()}
+                    onClick={e => {
+                      e.stopPropagation();
+                      onUpdateObject(selBalloon.id, { mergedPairId: shiftBalloon.id } as Partial<BalloonObj>);
+                      onUpdateObject(shiftBalloon.id, { mergedPairId: selBalloon.id } as Partial<BalloonObj>);
+                      setShiftSelectedId(null);
+                    }}
+                  >⊕ Merge</button>
+                )}
+              </div>
+            );
+          }
+
+          // Single merged balloon selected → offer unmerge
+          if (selBalloon?.mergedPairId && !shiftBalloon) {
+            return (
+              <div style={{ position: "absolute", left: selBalloon.x + selBalloon.w / 2 - 44, top: selBalloon.y - 36, zIndex: 200 }}>
+                <button
+                  style={btnStyle("#ef4444")}
+                  onPointerDown={e => e.stopPropagation()}
+                  onClick={e => {
+                    e.stopPropagation();
+                    const partnerId = selBalloon.mergedPairId!;
+                    onUpdateObject(selBalloon.id, { mergedPairId: undefined } as Partial<BalloonObj>);
+                    onUpdateObject(partnerId, { mergedPairId: undefined } as Partial<BalloonObj>);
+                  }}
+                >⊘ Unmerge</button>
+              </div>
+            );
+          }
+
+          return null;
+        })()}
+
+        {/* Comment pins */}
+        {comments.map(pin => (
+          <CommentPin key={pin.id} pin={pin} onResolve={() => onCommentResolve(pin.id)} />
+        ))}
+
+        {/* Comment draft */}
+        {commentDraft && (
+          <div style={{ position: "absolute", left: commentDraft.x, top: commentDraft.y, background: "#1e293b", border: "1px solid #3b82f6", borderRadius: 8, padding: 10, zIndex: 200, display: "flex", flexDirection: "column", gap: 6, minWidth: 200, boxShadow: "0 4px 20px rgba(0,0,0,0.5)" }}>
+            <textarea
+              autoFocus value={commentText} onChange={e => setCommentText(e.target.value)} rows={3}
+              placeholder="Add a note…"
+              style={{ background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: 6, fontSize: 13, resize: "none", outline: "none" }}
+              onKeyDown={e => {
+                if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitComment(); }
+                if (e.key === "Escape") { setCommentDraft(null); setCommentText(""); }
+              }}
+            />
+            <div style={{ display: "flex", gap: 6 }}>
+              <button onClick={submitComment} style={btnStyle("#3b82f6")}>Post</button>
+              <button onClick={() => { setCommentDraft(null); setCommentText(""); }} style={btnStyle("#334155")}>Cancel</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── FrameRenderer ─────────────────────────────────────────────────────────────
+
+function FrameRenderer({ frame, isSelected, onOpenPicker }: { frame: FrameObj; isSelected: boolean; onOpenPicker: () => void }) {
+  return (
+    <div
+      style={{
+        position: "absolute", left: frame.x, top: frame.y, width: frame.w, height: frame.h,
+        border: `3px solid ${isSelected ? "#3b82f6" : "#1e293b"}`,
+        overflow: "hidden", background: frame.imageUrl ? "transparent" : "#f8fafc",
+      }}
+    >
+      {frame.imageUrl ? (
+        <img src={frame.imageUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", pointerEvents: "none" }} />
+      ) : (
+        <button
+          onClick={e => { e.stopPropagation(); onOpenPicker(); }}
+          style={{
+            width: "100%", height: "100%", background: "none", border: "none", cursor: "pointer",
+            display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6,
+            color: "#94a3b8",
+          }}
+        >
+          <span style={{ fontSize: Math.min(frame.w, frame.h) * 0.18, lineHeight: 1 }}>+</span>
+          {frame.h > 60 && <span style={{ fontSize: Math.min(12, frame.h * 0.1), fontFamily: "Comic Neue, sans-serif" }}>click or drop image</span>}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ── FitText — auto-sizes text to fill its container ──────────────────────────
+
+function FitText({ html, fontFamily, color, align, w, h, lineHeight = 1.3 }: {
+  html: string; fontFamily: string; color: string; align?: string; w: number; h: number; lineHeight?: number;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    let lo = 6, hi = 120;
+    for (let i = 0; i < 10; i++) {
+      const mid = (lo + hi) / 2;
+      el.style.fontSize = mid + "px";
+      if (el.scrollHeight <= h * 0.78) lo = mid; else hi = mid;
+    }
+    el.style.fontSize = Math.floor(lo) + "px";
+  }, [html, w, h, fontFamily]);
+
+  return (
+    <div
+      ref={ref}
+      style={{ fontFamily, color, textAlign: align as React.CSSProperties["textAlign"], lineHeight, width: w, wordBreak: "break-word" }}
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  );
+}
+
+// ── TextContentEditor (sidebar rich-text editor) ─────────────────────────────
+
+function TextContentEditor({ id, content, fontFamily, fontSize, textColor, onContentChange, onFontSizeChange }: {
+  id: string; content: string; fontFamily: string; fontSize: number | undefined; textColor: string;
+  onContentChange: (html: string) => void; onFontSizeChange: (size: number | undefined) => void;
+}) {
+  const editorRef = useRef<HTMLDivElement>(null);
+  const savedRangeRef = useRef<Range | null>(null);
+  const [sizeVal, setSizeVal] = useState("");
+
+  // Re-initialise editor content only when the selected object changes
+  useEffect(() => {
+    if (editorRef.current) editorRef.current.innerHTML = content;
+    savedRangeRef.current = null;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  function saveSelection() {
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0 && editorRef.current?.contains(sel.anchorNode)) {
+      savedRangeRef.current = sel.getRangeAt(0).cloneRange();
+    }
+  }
+
+  function applyFontSize(px: number) {
+    const editor = editorRef.current;
+    if (!editor) return;
+    // Restore saved selection (focus was stolen by the <select>)
+    const sel = window.getSelection();
+    let range: Range | null = null;
+    if (sel && sel.rangeCount > 0 && editor.contains(sel.anchorNode) && !sel.isCollapsed) {
+      range = sel.getRangeAt(0);
+    } else if (savedRangeRef.current && !savedRangeRef.current.collapsed) {
+      sel?.removeAllRanges();
+      sel?.addRange(savedRangeRef.current);
+      range = savedRangeRef.current;
+    }
+    if (!range || range.collapsed) {
+      // No selection — update object-level default font size
+      onFontSizeChange(px);
+      return;
+    }
+    const span = document.createElement("span");
+    span.style.fontSize = px + "px";
+    try {
+      range.surroundContents(span);
+    } catch {
+      const frag = range.extractContents();
+      span.appendChild(frag);
+      range.insertNode(span);
+    }
+    editor.focus();
+    onContentChange(editor.innerHTML);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <span style={{ fontSize: 10, color: "#64748b", fontFamily: "Bangers, cursive", letterSpacing: 1, textTransform: "uppercase" }}>Text</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{ fontSize: 11, color: "#94a3b8", flexShrink: 0 }}>Size</span>
+        <select
+          value={sizeVal}
+          onMouseDown={saveSelection}
+          onChange={e => {
+            const raw = e.target.value;
+            setSizeVal("");
+            if (raw === "auto") { onFontSizeChange(undefined); return; }
+            const size = Number(raw);
+            if (size) applyFontSize(size);
+          }}
+          style={{ flex: 1, background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: "3px 5px", fontSize: 11, cursor: "pointer" }}
+        >
+          <option value="">Size…</option>
+          <option value="auto">Auto (fit)</option>
+          {FONT_SIZES.map(s => <option key={s} value={s}>{s}px</option>)}
+        </select>
+      </div>
+      <div
+        ref={editorRef}
+        contentEditable
+        suppressContentEditableWarning
+        onInput={() => { if (editorRef.current) onContentChange(editorRef.current.innerHTML); }}
+        onBlur={saveSelection}
+        style={{
+          minHeight: 72, background: "#0f172a", border: "1px solid #334155", borderRadius: 4,
+          padding: 8, color: textColor === "#0f172a" ? "#e2e8f0" : textColor,
+          fontFamily, fontSize, lineHeight: 1.4,
+          outline: "none", wordBreak: "break-word",
+        }}
+      />
+    </div>
+  );
+}
+
+// ── TextRenderer ──────────────────────────────────────────────────────────────
+
+function TextRenderer({ obj, isSelected }: { obj: TextObj; isSelected: boolean }) {
+  const textColor = obj.textColor ?? "#0f172a";
+  const font = obj.fontFamily ?? "Bangers, cursive";
+  const pad = 6;
+  const innerW = obj.w - pad * 2, innerH = obj.h - pad * 2;
+  return (
+    <div style={{ position: "absolute", left: obj.x, top: obj.y, width: obj.w, height: obj.h, border: isSelected ? "1.5px solid #3b82f6" : "1.5px dashed #94a3b8", padding: pad, background: obj.bgColor ?? "transparent", pointerEvents: "none", overflow: "hidden", boxSizing: "border-box" }}>
+      {obj.fontSize ? (
+        <div style={{ fontFamily: font, fontSize: obj.fontSize, color: textColor, lineHeight: 1.3 }} dangerouslySetInnerHTML={{ __html: obj.content }} />
+      ) : (
+        <FitText html={obj.content} fontFamily={font} color={textColor} w={innerW} h={innerH} />
+      )}
+    </div>
+  );
+}
+
+// ── NarrationRenderer ─────────────────────────────────────────────────────────
+
+function NarrationRenderer({ obj, isSelected }: { obj: NarrationObj; isSelected: boolean }) {
+  const font = obj.fontFamily ?? "Bangers, cursive";
+  const padX = 8, padY = 5;
+  const innerW = obj.w - padX * 2, innerH = obj.h - padY * 2;
+  return (
+    <div style={{ position: "absolute", left: obj.x, top: obj.y, width: obj.w, height: obj.h, border: `2px solid ${obj.borderColor ?? obj.textColor}`, background: obj.bgColor, padding: `${padY}px ${padX}px`, pointerEvents: "none", overflow: "hidden", boxSizing: "border-box" }}>
+      {obj.fontSize ? (
+        <div style={{ fontFamily: font, fontSize: obj.fontSize, color: obj.textColor, lineHeight: 1.35 }} dangerouslySetInnerHTML={{ __html: obj.content }} />
+      ) : (
+        <FitText html={obj.content} fontFamily={font} color={obj.textColor} w={innerW} h={innerH} lineHeight={1.35} />
+      )}
+    </div>
+  );
+}
+
+// ── BalloonRenderer ───────────────────────────────────────────────────────────
+
+function BalloonRenderer({ obj, allBalloons, isSelected, incomingConnections, mergedPartner, onStemDragStart, onStemBendDragStart, onStemOriginDragStart }: {
+  obj: BalloonObj; allBalloons: BalloonObj[]; isSelected: boolean;
+  incomingConnections: BalloonObj[];
+  mergedPartner?: BalloonObj;
+  onStemDragStart: (e: React.PointerEvent) => void;
+  onStemBendDragStart: (ang: number, e: React.PointerEvent) => void;
+  onStemOriginDragStart: (e: React.PointerEvent) => void;
+}) {
+  const cx = obj.x + obj.w / 2, cy = obj.y + obj.h / 2;
+  const rx = obj.w / 2, ry = obj.h / 2;
+  const bubbleFill = obj.bgColor ?? "#ffffff";
+  const textColor  = obj.textColor ?? "#0f172a";
+  const font       = obj.fontFamily ?? "Bangers, cursive";
+
+  // Resolve stem tip & connected target
+  let tipX = cx + obj.stemDx, tipY = cy + obj.stemDy;
+  let connectedTarget: BalloonObj | null = null;
+
+  let stemEntryAng = 0, stemEntryTcx = 0, stemEntryTcy = 0, stemEntryTRx = 0, stemEntryTRy = 0;
+  if (obj.stemTargetId) {
+    const target = allBalloons.find(b => b.id === obj.stemTargetId);
+    if (target) {
+      connectedTarget = target;
+      const tcx = target.x + target.w / 2, tcy = target.y + target.h / 2;
+      const toAng = Math.atan2(cy - tcy, cx - tcx); // angle from A's center toward B
+      // Center of the entry opening on A's surface
+      tipX = tcx + (target.w / 2) * Math.cos(toAng);
+      tipY = tcy + (target.h / 2) * Math.sin(toAng);
+      stemEntryAng = toAng;
+      stemEntryTcx = tcx; stemEntryTcy = tcy;
+      stemEntryTRx = target.w / 2; stemEntryTRy = target.h / 2;
+    }
+  }
+
+  if ((tipX - cx) ** 2 + (tipY - cy) ** 2 < 4) { tipX = cx; tipY = cy + ry + 40; }
+
+  const stemAng = Math.atan2(tipY - cy, tipX - cx);
+  // For connected balloons, allow independent control of where the stem exits the body
+  const stemBaseAng = (connectedTarget && obj.stemOriginAng !== undefined) ? obj.stemOriginAng : stemAng;
+  const delta = connectedTarget ? 0.0625 : 0.10;
+  const b1x = cx + rx * Math.cos(stemBaseAng + delta), b1y = cy + ry * Math.sin(stemBaseAng + delta);
+  const b2x = cx + rx * Math.cos(stemBaseAng - delta), b2y = cy + ry * Math.sin(stemBaseAng - delta);
+
+  // Perpendicular to the direction from origin midpoint toward tip
+  const stemMidX = (b1x + b2x) / 2, stemMidY = (b1y + b2y) / 2;
+  const stemDirAng = Math.atan2(tipY - stemMidY, tipX - stemMidX);
+  const perpX = Math.cos(stemDirAng + Math.PI / 2), perpY = Math.sin(stemDirAng + Math.PI / 2);
+  const bend = obj.stemBend;
+
+  // Build main arc (32 polyline segments) — gap at stemBaseAng
+  const N = 32;
+  const arcSpan = 2 * Math.PI - 2 * delta;
+  const startAng = stemBaseAng + delta;
+  const arcPts: string[] = [];
+  for (let i = 0; i <= N; i++) {
+    const a = startAng + (i / N) * arcSpan;
+    arcPts.push((i === 0 ? `M ` : `L `) + `${(cx + rx * Math.cos(a)).toFixed(2)},${(cy + ry * Math.sin(a)).toFixed(2)}`);
+  }
+  const arcOnlyD = arcPts.join(" "); // arc from b1 to b2, no stem
+
+  // Two edge points on A's surface for the connected opening (same angular width as stem base)
+  let stemConnTipRx = 0, stemConnTipRy = 0, stemConnTipLx = 0, stemConnTipLy = 0;
+  if (connectedTarget) {
+    stemConnTipRx = stemEntryTcx + stemEntryTRx * Math.cos(stemEntryAng + STEM_CONNECT_TIP_DELTA);
+    stemConnTipRy = stemEntryTcy + stemEntryTRy * Math.sin(stemEntryAng + STEM_CONNECT_TIP_DELTA);
+    stemConnTipLx = stemEntryTcx + stemEntryTRx * Math.cos(stemEntryAng - STEM_CONNECT_TIP_DELTA);
+    stemConnTipLy = stemEntryTcy + stemEntryTRy * Math.sin(stemEntryAng - STEM_CONNECT_TIP_DELTA);
+  }
+
+  // Bezier control points — for connected, aim at the two opening edges; for normal, aim at single tip
+  const cp1x = connectedTarget
+    ? (b2x + stemConnTipRx) / 2 + bend * perpX
+    : (b2x + tipX) / 2 + bend * perpX;
+  const cp1y = connectedTarget
+    ? (b2y + stemConnTipRy) / 2 + bend * perpY
+    : (b2y + tipY) / 2 + bend * perpY;
+  const cp2x = connectedTarget
+    ? (stemConnTipLx + b1x) / 2 + bend * perpX
+    : (tipX + b1x) / 2 + bend * perpX;
+  const cp2y = connectedTarget
+    ? (stemConnTipLy + b1y) / 2 + bend * perpY
+    : (tipY + b1y) / 2 + bend * perpY;
+  const bhx = (cp1x + cp2x) / 2, bhy = (cp1y + cp2y) / 2;
+
+  // Normal (non-connected) full path with stem
+  const pts = [...arcPts];
+  pts.push(`Q ${cp1x.toFixed(2)},${cp1y.toFixed(2)} ${tipX.toFixed(2)},${tipY.toFixed(2)}`);
+  pts.push(`Q ${cp2x.toFixed(2)},${cp2y.toFixed(2)} ${b1x.toFixed(2)},${b1y.toFixed(2)}`);
+  pts.push("Z");
+  const pathD = pts.join(" ");
+  const stroke = obj.borderColor ?? "#1e293b";
+
+  // ── Compound (merged pair) rendering ─────────────────────────────────────
+  if (mergedPartner) {
+    const Bcx = mergedPartner.x + mergedPartner.w / 2, Bcy = mergedPartner.y + mergedPartner.h / 2;
+    const Brx = mergedPartner.w / 2, Bry = mergedPartner.h / 2;
+
+    const insideB = (px: number, py: number) => ((px - Bcx) / Brx) ** 2 + ((py - Bcy) / Bry) ** 2 < 1;
+    const insideA = (px: number, py: number) => ((px - cx) / rx) ** 2 + ((py - cy) / ry) ** 2 < 1;
+
+    // Binary-search for the precise angle where arc crosses the ellipse boundary.
+    const findCrossing = (
+      loAng: number, hiAng: number,
+      ecx: number, ecy: number, erx: number, ery: number,
+      inside: (px: number, py: number) => boolean,
+      wantInside: boolean
+    ): number => {
+      for (let k = 0; k < 10; k++) {
+        const mid = (loAng + hiAng) / 2;
+        const mpx = ecx + erx * Math.cos(mid), mpy = ecy + ery * Math.sin(mid);
+        if (inside(mpx, mpy) === wantInside) hiAng = mid; else loAng = mid;
+      }
+      return (loAng + hiAng) / 2;
+    };
+
+    // Exterior arc of A: walk the stem-gap arc, skip points inside B; snap to exact crossing
+    const NE = 128;
+    const extA: string[] = [];
+    let penA = false;
+    for (let i = 0; i <= NE; i++) {
+      const a = startAng + (i / NE) * arcSpan;
+      const px = cx + rx * Math.cos(a), py = cy + ry * Math.sin(a);
+      const inside = insideB(px, py);
+      if (!inside) {
+        if (!penA && i > 0) {
+          // entering visible zone — find exact crossing and start there
+          const prevA = startAng + ((i - 1) / NE) * arcSpan;
+          const ca = findCrossing(prevA, a, cx, cy, rx, ry, insideB, false);
+          extA.push(`M ${(cx + rx * Math.cos(ca)).toFixed(2)},${(cy + ry * Math.sin(ca)).toFixed(2)}`);
+        }
+        extA.push(`${penA ? "L" : "M"} ${px.toFixed(2)},${py.toFixed(2)}`);
+        penA = true;
+      } else {
+        if (penA && i > 0) {
+          // leaving visible zone — snap to exact crossing
+          const prevA = startAng + ((i - 1) / NE) * arcSpan;
+          const ca = findCrossing(prevA, a, cx, cy, rx, ry, insideB, true);
+          extA.push(`L ${(cx + rx * Math.cos(ca)).toFixed(2)},${(cy + ry * Math.sin(ca)).toFixed(2)}`);
+        }
+        penA = false;
+      }
+    }
+
+    // Exterior arc of B: full 2π, skip points inside A; snap to exact crossing
+    const extB: string[] = [];
+    let penB = false;
+    for (let i = 0; i <= NE; i++) {
+      const a = (i / NE) * 2 * Math.PI;
+      const px = Bcx + Brx * Math.cos(a), py = Bcy + Bry * Math.sin(a);
+      const inside = insideA(px, py);
+      if (!inside) {
+        if (!penB && i > 0) {
+          const prevA = ((i - 1) / NE) * 2 * Math.PI;
+          const ca = findCrossing(prevA, a, Bcx, Bcy, Brx, Bry, insideA, false);
+          extB.push(`M ${(Bcx + Brx * Math.cos(ca)).toFixed(2)},${(Bcy + Bry * Math.sin(ca)).toFixed(2)}`);
+        }
+        extB.push(`${penB ? "L" : "M"} ${px.toFixed(2)},${py.toFixed(2)}`);
+        penB = true;
+      } else {
+        if (penB && i > 0) {
+          const prevA = ((i - 1) / NE) * 2 * Math.PI;
+          const ca = findCrossing(prevA, a, Bcx, Bcy, Brx, Bry, insideA, true);
+          extB.push(`L ${(Bcx + Brx * Math.cos(ca)).toFixed(2)},${(Bcy + Bry * Math.sin(ca)).toFixed(2)}`);
+        }
+        penB = false;
+      }
+    }
+
+    // Stem: closed fill (white wedge) + open stroke sides
+    const stemFillD = `M ${b2x.toFixed(2)},${b2y.toFixed(2)} Q ${cp1x.toFixed(2)},${cp1y.toFixed(2)} ${tipX.toFixed(2)},${tipY.toFixed(2)} Q ${cp2x.toFixed(2)},${cp2y.toFixed(2)} ${b1x.toFixed(2)},${b1y.toFixed(2)} Z`;
+    const stemStrokeD = `M ${b2x.toFixed(2)},${b2y.toFixed(2)} Q ${cp1x.toFixed(2)},${cp1y.toFixed(2)} ${tipX.toFixed(2)},${tipY.toFixed(2)} Q ${cp2x.toFixed(2)},${cp2y.toFixed(2)} ${b1x.toFixed(2)},${b1y.toFixed(2)}`;
+
+    const renderText = (b: BalloonObj, bCx: number, bCy: number, bRx: number, bRy: number) => {
+      const iw = b.w - 24, ih = b.h - 20;
+      return (
+        <div key={b.id}
+          style={{ position: "absolute", left: bCx - bRx + 12, top: bCy - bRy + 10, width: iw, height: ih, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", overflow: "hidden" }}
+        >
+          {b.fontSize ? (
+            <div style={{ fontFamily: font, fontSize: b.fontSize, color: textColor, textAlign: "center", lineHeight: 1.3 }} dangerouslySetInnerHTML={{ __html: b.content }} />
+          ) : (
+            <FitText html={b.content} fontFamily={font} color={textColor} align="center" w={iw} h={ih} />
+          )}
+        </div>
+      );
+    };
+
+    return (
+      <>
+        <svg style={{ position: "absolute", left: 0, top: 0, width: PAGE_W, height: PAGE_H, overflow: "visible", pointerEvents: "none" }}>
+          {/* Fill both ellipses (no stroke) */}
+          <ellipse cx={cx} cy={cy} rx={rx} ry={ry} fill={bubbleFill} stroke="none" />
+          <ellipse cx={Bcx} cy={Bcy} rx={Brx} ry={Bry} fill={bubbleFill} stroke="none" />
+          {/* Stem fill */}
+          <path d={stemFillD} fill={bubbleFill} stroke="none" />
+          {/* Exterior arcs only */}
+          <path d={extA.join(" ")} fill="none" stroke={stroke} strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round" />
+          <path d={extB.join(" ")} fill="none" stroke={stroke} strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round" />
+          {/* Stem sides */}
+          <path d={stemStrokeD} fill="none" stroke={stroke} strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round" />
+          {isSelected && (
+            <>
+              <circle cx={tipX} cy={tipY} r={6} fill="#3b82f6" stroke="white" strokeWidth={2}
+                style={{ cursor: "crosshair", pointerEvents: "all" }}
+                onPointerDown={e => { e.stopPropagation(); onStemDragStart(e); }} />
+              <circle cx={bhx} cy={bhy} r={5} fill="#10b981" stroke="white" strokeWidth={2}
+                style={{ cursor: "move", pointerEvents: "all" }}
+                onPointerDown={e => { e.stopPropagation(); onStemBendDragStart(stemAng, e); }} />
+            </>
+          )}
+        </svg>
+        {renderText(obj, cx, cy, rx, ry)}
+        {renderText(mergedPartner, Bcx, Bcy, Brx, Bry)}
+      </>
+    );
+  }
+
+  // ── Standard (non-merged) rendering ──────────────────────────────────────
+  return (
+    <>
+      <svg style={{ position: "absolute", left: 0, top: 0, width: PAGE_W, height: PAGE_H, overflow: "visible", pointerEvents: "none" }}>
+        {connectedTarget ? (
+          // B: body arc (stroked) + stem fill-only + two curved side strokes — never stroke A's surface
+          <>
+            {/* B's body arc with gap where stem exits */}
+            <path d={arcOnlyD} fill={bubbleFill} stroke={stroke} strokeWidth={2.5} strokeLinejoin="round" />
+            {/* Stem fill — covers the whole stem area without stroking A's edge */}
+            <path
+              d={`M ${b2x.toFixed(2)},${b2y.toFixed(2)} Q ${cp1x.toFixed(2)},${cp1y.toFixed(2)} ${stemConnTipRx.toFixed(2)},${stemConnTipRy.toFixed(2)} L ${stemConnTipLx.toFixed(2)},${stemConnTipLy.toFixed(2)} Q ${cp2x.toFixed(2)},${cp2y.toFixed(2)} ${b1x.toFixed(2)},${b1y.toFixed(2)} Z`}
+              fill={bubbleFill} stroke="none"
+            />
+            {/* Two curved stem sides — stroked, not crossing A's surface */}
+            <path
+              d={`M ${b2x.toFixed(2)},${b2y.toFixed(2)} Q ${cp1x.toFixed(2)},${cp1y.toFixed(2)} ${stemConnTipRx.toFixed(2)},${stemConnTipRy.toFixed(2)} M ${stemConnTipLx.toFixed(2)},${stemConnTipLy.toFixed(2)} Q ${cp2x.toFixed(2)},${cp2y.toFixed(2)} ${b1x.toFixed(2)},${b1y.toFixed(2)}`}
+              fill="none" stroke={stroke} strokeWidth={2.5} strokeLinecap="round"
+            />
+          </>
+        ) : (
+          <>
+            <path d={pathD} fill={bubbleFill} stroke={stroke} strokeWidth={2.5} strokeLinejoin="round" />
+            {/* Erase this balloon's border where a child balloon's stem enters */}
+            {allBalloons.filter(b => b.stemTargetId === obj.id).map(b => {
+              const bcx = b.x + b.w / 2, bcy = b.y + b.h / 2;
+              const entryAng = Math.atan2(bcy - cy, bcx - cx);
+              const erPts: string[] = [];
+              for (let i = 0; i <= 10; i++) {
+                const a = (entryAng - STEM_CONNECT_TIP_DELTA) + (i / 10) * (2 * STEM_CONNECT_TIP_DELTA);
+                erPts.push((i === 0 ? "M " : "L ") + `${(cx + rx * Math.cos(a)).toFixed(2)},${(cy + ry * Math.sin(a)).toFixed(2)}`);
+              }
+              return <path key={b.id} d={erPts.join(" ")} fill="none" stroke={bubbleFill} strokeWidth={10} strokeLinecap="butt" />;
+            })}
+          </>
+        )}
+
+
+        {isSelected && (
+          <>
+            <circle cx={tipX} cy={tipY} r={6} fill="#3b82f6" stroke="white" strokeWidth={2}
+              style={{ cursor: "crosshair", pointerEvents: "all" }}
+              onPointerDown={e => { e.stopPropagation(); onStemDragStart(e); }}
+            />
+            <circle cx={bhx} cy={bhy} r={5} fill="#10b981" stroke="white" strokeWidth={2}
+              style={{ cursor: "move", pointerEvents: "all" }}
+              onPointerDown={e => { e.stopPropagation(); onStemBendDragStart(stemAng, e); }}
+            />
+            {connectedTarget && (
+              <circle
+                cx={cx + rx * Math.cos(stemBaseAng)} cy={cy + ry * Math.sin(stemBaseAng)}
+                r={6} fill="#f97316" stroke="white" strokeWidth={2}
+                style={{ cursor: "grab", pointerEvents: "all" }}
+                onPointerDown={e => { e.stopPropagation(); onStemOriginDragStart(e); }}
+              />
+            )}
+          </>
+        )}
+      </svg>
+
+      <div style={{ position: "absolute", left: cx - rx + 12, top: cy - ry + 10, width: obj.w - 24, height: obj.h - 20, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", overflow: "hidden" }}>
+        {obj.fontSize ? (
+          <div style={{ fontFamily: font, fontSize: obj.fontSize, color: textColor, textAlign: "center", lineHeight: 1.3 }} dangerouslySetInnerHTML={{ __html: obj.content }} />
+        ) : (
+          <FitText html={obj.content} fontFamily={font} color={textColor} align="center" w={obj.w - 24} h={obj.h - 20} />
+        )}
+      </div>
+    </>
+  );
+}
+
+// ── SelectionHandles ──────────────────────────────────────────────────────────
+
+const HANDLES = ["nw","n","ne","e","se","s","sw","w"] as const;
+type HandleDir = typeof HANDLES[number];
+
+function handlePosition(obj: PageObj, h: HandleDir): { left: number; top: number } {
+  const cx = obj.x + obj.w / 2, cy = obj.y + obj.h / 2;
+  const x = h.includes("w") ? obj.x : h.includes("e") ? obj.x + obj.w : cx;
+  const y = h.includes("n") ? obj.y : h.includes("s") ? obj.y + obj.h : cy;
+  return { left: x - 5, top: y - 5 };
+}
+
+const HANDLE_CURSORS: Record<HandleDir, string> = {
+  nw: "nw-resize", n: "n-resize", ne: "ne-resize",
+  e: "e-resize", se: "se-resize", s: "s-resize", sw: "sw-resize", w: "w-resize",
+};
+
+function SelectionHandles({ obj, onStartResize }: {
+  obj: PageObj;
+  onStartResize: (handle: string, e: React.PointerEvent) => void;
+}) {
+  return (
+    <>
+      {/* Bounding box */}
+      <div style={{ position: "absolute", left: obj.x - 1, top: obj.y - 1, width: obj.w + 2, height: obj.h + 2, border: "1.5px solid #3b82f6", pointerEvents: "none" }} />
+      {/* Handles */}
+      {HANDLES.map(h => {
+        const pos = handlePosition(obj, h);
+        return (
+          <div
+            key={h}
+            style={{ position: "absolute", ...pos, width: 10, height: 10, background: "#fff", border: "2px solid #3b82f6", borderRadius: 2, cursor: HANDLE_CURSORS[h], zIndex: 100 }}
+            onPointerDown={e => { e.stopPropagation(); onStartResize(h, e); }}
+          />
+        );
+      })}
+    </>
+  );
+}
+
+// ── CommentPin ────────────────────────────────────────────────────────────────
+
+function CommentPin({ pin, onResolve }: { pin: CommentPin; onResolve: () => void }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ position: "absolute", left: pin.x - 10, top: pin.y - 10, zIndex: 50 }}>
+      <div
+        onClick={e => { e.stopPropagation(); setOpen(v => !v); }}
+        style={{ width: 20, height: 20, borderRadius: "50% 50% 50% 0", background: "#3b82f6", border: "2px solid #1d4ed8", cursor: "pointer", transform: "rotate(-45deg)" }}
+      />
       {open && (
         <div style={{ position: "absolute", left: 24, top: 0, background: "#1e293b", border: "1px solid #3b82f6", borderRadius: 8, padding: 10, minWidth: 180, zIndex: 60 }}>
           <p style={{ margin: "0 0 6px", fontSize: 12, color: "#e2e8f0" }}>{pin.text}</p>
@@ -791,24 +1689,436 @@ function CommentPinMarker({ pin, zoom, onResolve }: { pin: CommentPin; zoom: num
   );
 }
 
-function ColorRow({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-      <span style={{ fontSize: 11, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 0.8 }}>{label}</span>
-      <input
-        type="color"
-        value={value}
-        onChange={e => onChange(e.target.value)}
-        style={{ width: 40, height: 26, padding: 2, border: "1px solid #475569", borderRadius: 4, cursor: "pointer", background: "none" }}
-      />
-    </div>
-  );
-}
+// ── Style helpers ─────────────────────────────────────────────────────────────
 
 function btnStyle(bg: string): React.CSSProperties {
   return { background: bg, border: "none", color: "#fff", borderRadius: 5, padding: "4px 10px", fontSize: 12, cursor: "pointer", fontFamily: "Comic Neue, sans-serif" };
 }
 
 function toolBtnStyle(active: boolean, bg?: string): React.CSSProperties {
-  return { width: 40, height: 40, borderRadius: 8, background: active ? "#1d4ed8" : (bg || "#0f172a"), border: `1px solid ${active ? "#3b82f6" : "#334155"}`, color: active ? "#fff" : "#94a3b8", fontSize: 16, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.15s" };
+  return { width: 40, height: 40, borderRadius: 8, background: active ? "#1d4ed8" : (bg ?? "#0f172a"), border: `1px solid ${active ? "#3b82f6" : "#334155"}`, color: active ? "#fff" : "#94a3b8", fontSize: 16, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.15s" };
+}
+
+// ── Color utilities ───────────────────────────────────────────────────────────
+
+function hsvToHex(h: number, s: number, v: number): string {
+  const f = (n: number) => {
+    const k = (n + h / 60) % 6;
+    return v - v * s * Math.max(Math.min(k, 4 - k, 1), 0);
+  };
+  const r = Math.round(f(5) * 255), g = Math.round(f(3) * 255), b = Math.round(f(1) * 255);
+  return "#" + [r, g, b].map(x => x.toString(16).padStart(2, "0")).join("");
+}
+
+function hexToHsv(hex: string): [number, number, number] {
+  const clean = hex.replace("#", "").slice(0, 6).padEnd(6, "0");
+  const r = parseInt(clean.slice(0, 2), 16) / 255;
+  const g = parseInt(clean.slice(2, 4), 16) / 255;
+  const b = parseInt(clean.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  const v = max;
+  const s = max === 0 ? 0 : d / max;
+  let hh = 0;
+  if (d !== 0) {
+    if (max === r) hh = 60 * (((g - b) / d) % 6);
+    else if (max === g) hh = 60 * ((b - r) / d + 2);
+    else hh = 60 * ((r - g) / d + 4);
+  }
+  return [hh < 0 ? hh + 360 : hh, s, v];
+}
+
+// ── ColorPicker ───────────────────────────────────────────────────────────────
+
+function ColorPicker({ value, onChange }: { value: string; onChange: (hex: string) => void }) {
+  const [hsv, setHsv] = useState<[number, number, number]>(() => hexToHsv(value));
+  const [hexInput, setHexInput] = useState(value);
+  const svRef  = useRef<HTMLDivElement>(null);
+  const hueRef = useRef<HTMLDivElement>(null);
+  const draggingSv  = useRef(false);
+  const draggingHue = useRef(false);
+
+  useEffect(() => {
+    const parsed = hexToHsv(value);
+    setHsv(parsed);
+    setHexInput(value);
+  }, [value]);
+
+  function updateHsv(h: number, s: number, v: number) {
+    const hex = hsvToHex(h, s, v);
+    setHsv([h, s, v]);
+    setHexInput(hex);
+    onChange(hex);
+  }
+
+  function handleSv(e: React.PointerEvent) {
+    const rect = svRef.current!.getBoundingClientRect();
+    const s = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const v = Math.max(0, Math.min(1, 1 - (e.clientY - rect.top) / rect.height));
+    updateHsv(hsv[0], s, v);
+  }
+
+  function handleHue(e: React.PointerEvent) {
+    const rect = hueRef.current!.getBoundingClientRect();
+    const h = Math.max(0, Math.min(360, ((e.clientX - rect.left) / rect.width) * 360));
+    updateHsv(h, hsv[1], hsv[2]);
+  }
+
+  const [h, s, v] = hsv;
+  const hueColor = hsvToHex(h, 1, 1);
+  const currentHex = hsvToHex(h, s, v);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+      {/* SV square */}
+      <div
+        ref={svRef}
+        style={{ width: "100%", height: 110, borderRadius: 5, position: "relative", cursor: "crosshair", background: hueColor, userSelect: "none", flexShrink: 0 }}
+        onPointerDown={e => { draggingSv.current = true; svRef.current!.setPointerCapture(e.pointerId); handleSv(e); }}
+        onPointerMove={e => { if (draggingSv.current) handleSv(e); }}
+        onPointerUp={() => { draggingSv.current = false; }}
+      >
+        <div style={{ position: "absolute", inset: 0, borderRadius: 5, background: "linear-gradient(to right, #fff, transparent)" }} />
+        <div style={{ position: "absolute", inset: 0, borderRadius: 5, background: "linear-gradient(to bottom, transparent, #000)" }} />
+        <div style={{
+          position: "absolute",
+          left: `${s * 100}%`, top: `${(1 - v) * 100}%`,
+          width: 12, height: 12, borderRadius: "50%",
+          border: "2px solid #fff", transform: "translate(-50%, -50%)",
+          boxShadow: "0 0 0 1px rgba(0,0,0,0.4)", pointerEvents: "none",
+        }} />
+      </div>
+      {/* Hue bar */}
+      <div
+        ref={hueRef}
+        style={{ width: "100%", height: 12, borderRadius: 6, position: "relative", cursor: "crosshair", userSelect: "none", background: "linear-gradient(to right,hsl(0,100%,50%),hsl(60,100%,50%),hsl(120,100%,50%),hsl(180,100%,50%),hsl(240,100%,50%),hsl(300,100%,50%),hsl(360,100%,50%))" }}
+        onPointerDown={e => { draggingHue.current = true; hueRef.current!.setPointerCapture(e.pointerId); handleHue(e); }}
+        onPointerMove={e => { if (draggingHue.current) handleHue(e); }}
+        onPointerUp={() => { draggingHue.current = false; }}
+      >
+        <div style={{ position: "absolute", left: `${(h / 360) * 100}%`, top: "50%", width: 16, height: 16, borderRadius: "50%", border: "2px solid #fff", background: hueColor, transform: "translate(-50%, -50%)", pointerEvents: "none", boxShadow: "0 0 0 1px rgba(0,0,0,0.4)" }} />
+      </div>
+      {/* Hex row */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <div style={{ width: 22, height: 22, borderRadius: 4, background: currentHex, border: "1px solid #475569", flexShrink: 0 }} />
+        <input
+          value={hexInput}
+          onChange={e => {
+            setHexInput(e.target.value);
+            if (/^#[0-9a-fA-F]{6}$/.test(e.target.value)) {
+              const [nh, ns, nv] = hexToHsv(e.target.value);
+              setHsv([nh, ns, nv]);
+              onChange(e.target.value);
+            }
+          }}
+          style={{ flex: 1, background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: "3px 7px", fontSize: 12, outline: "none", fontFamily: "monospace" }}
+          placeholder="#000000"
+          spellCheck={false}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ── GradientEditor ────────────────────────────────────────────────────────────
+
+function GradientEditor({ gradient, onChange }: { gradient: GradientDef; onChange: (g: GradientDef) => void }) {
+  const [activeStop, setActiveStop] = useState<0 | 1>(0);
+  const previewBg = `linear-gradient(${gradient.angle}deg, ${gradient.stops[0].color}, ${gradient.stops[1].color})`;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ height: 18, borderRadius: 4, background: previewBg, border: "1px solid #334155" }} />
+      <div style={{ display: "flex", gap: 5 }}>
+        {([0, 1] as const).map(i => (
+          <button key={i} onClick={() => setActiveStop(i)} style={{
+            flex: 1, padding: "4px 0", borderRadius: 4, cursor: "pointer",
+            background: gradient.stops[i].color,
+            border: `2px solid ${activeStop === i ? "#3b82f6" : "#334155"}`,
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}>
+            <span style={{ fontSize: 10, color: "#fff", textShadow: "0 0 4px #000", fontWeight: 700 }}>Stop {i + 1}</span>
+          </button>
+        ))}
+      </div>
+      <ColorPicker
+        value={gradient.stops[activeStop].color}
+        onChange={color => {
+          const stops: [GradientStop, GradientStop] = [{ ...gradient.stops[0] }, { ...gradient.stops[1] }];
+          stops[activeStop] = { ...stops[activeStop], color };
+          onChange({ ...gradient, stops });
+        }}
+      />
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{ fontSize: 11, color: "#94a3b8", flexShrink: 0 }}>Angle</span>
+        <input type="range" min={0} max={360} value={gradient.angle}
+          onChange={e => onChange({ ...gradient, angle: Number(e.target.value) })}
+          style={{ flex: 1 }} />
+        <span style={{ fontSize: 11, color: "#64748b", width: 30, textAlign: "right" }}>{gradient.angle}°</span>
+      </div>
+    </div>
+  );
+}
+
+// ── WordArtRenderer ───────────────────────────────────────────────────────────
+
+function WordArtRenderer({ obj, isSelected }: { obj: WordArtObj; isSelected: boolean }) {
+  const uid = obj.id.replace(/-/g, "");
+  const padX = 14;
+  const arcStartX = obj.x + padX;
+  const arcEndX   = obj.x + obj.w - padX;
+  const arcChord  = arcEndX - arcStartX;
+  const baseY     = obj.y + obj.h / 2;
+  const sagitta   = (obj.curve / 100) * obj.h * 0.45;
+
+  let textPathD: string;
+  if (Math.abs(sagitta) < 1) {
+    textPathD = `M ${arcStartX},${baseY} L ${arcEndX},${baseY}`;
+  } else {
+    const R = (arcChord * arcChord / 4 + sagitta * sagitta) / (2 * Math.abs(sagitta));
+    const sweep = sagitta > 0 ? 0 : 1;
+    textPathD = `M ${arcStartX},${baseY} A ${R},${R} 0 0,${sweep} ${arcEndX},${baseY}`;
+  }
+
+  const filterId   = `waf-${uid}`;
+  const textGradId = `watg-${uid}`;
+  const bgGradId   = `wabg-${uid}`;
+  const pathId     = `wap-${uid}`;
+
+  function gradVec(angle: number) {
+    const rad = (angle - 90) * Math.PI / 180;
+    const cx = obj.x + obj.w / 2, cy = obj.y + obj.h / 2;
+    const d = Math.sqrt(obj.w * obj.w + obj.h * obj.h) / 2;
+    return { x1: cx - Math.cos(rad) * d, y1: cy - Math.sin(rad) * d, x2: cx + Math.cos(rad) * d, y2: cy + Math.sin(rad) * d };
+  }
+
+  const tg = obj.textGradient ? gradVec(obj.textGradient.angle) : null;
+  const bg = obj.bg.type === "gradient" ? gradVec(obj.bg.angle) : null;
+
+  return (
+    <svg style={{ position: "absolute", left: 0, top: 0, width: PAGE_W, height: PAGE_H, overflow: "visible", pointerEvents: "none" }}>
+      <defs>
+        {obj.shadow && (
+          <filter id={filterId} x="-60%" y="-60%" width="220%" height="220%">
+            <feDropShadow dx={obj.shadow.dx} dy={obj.shadow.dy} stdDeviation={obj.shadow.blur / 2} floodColor={obj.shadow.color} floodOpacity="1" />
+          </filter>
+        )}
+        {obj.textGradient && tg && (
+          <linearGradient id={textGradId} gradientUnits="userSpaceOnUse" x1={tg.x1} y1={tg.y1} x2={tg.x2} y2={tg.y2}>
+            {obj.textGradient.stops.map((st, i) => <stop key={i} offset={st.pos} stopColor={st.color} />)}
+          </linearGradient>
+        )}
+        {obj.bg.type === "gradient" && bg && (
+          <linearGradient id={bgGradId} gradientUnits="userSpaceOnUse" x1={bg.x1} y1={bg.y1} x2={bg.x2} y2={bg.y2}>
+            {(obj.bg as GradientDef & { type: "gradient" }).stops.map((st, i) => <stop key={i} offset={st.pos} stopColor={st.color} />)}
+          </linearGradient>
+        )}
+        <path id={pathId} d={textPathD} />
+      </defs>
+
+      {/* Background */}
+      {obj.bg.type === "solid" && (
+        <rect x={obj.x} y={obj.y} width={obj.w} height={obj.h} fill={obj.bg.color} />
+      )}
+      {obj.bg.type === "gradient" && (
+        <rect x={obj.x} y={obj.y} width={obj.w} height={obj.h} fill={`url(#${bgGradId})`} />
+      )}
+      {obj.bg.type === "image" && (
+        <image href={obj.bg.url} x={obj.x} y={obj.y} width={obj.w} height={obj.h} preserveAspectRatio="xMidYMid slice" />
+      )}
+
+      {/* Text */}
+      <text
+        fill={obj.textGradient ? `url(#${textGradId})` : obj.textColor}
+        fontFamily={obj.fontFamily}
+        fontSize={obj.fontSize}
+        fontWeight="bold"
+        stroke={obj.outline ? obj.outline.color : "none"}
+        strokeWidth={obj.outline ? obj.outline.width : 0}
+        paintOrder="stroke fill"
+        filter={obj.shadow ? `url(#${filterId})` : undefined}
+      >
+        <textPath href={`#${pathId}`} startOffset="50%" textAnchor="middle">
+          {obj.content}
+        </textPath>
+      </text>
+
+      {/* Selection indicator */}
+      {isSelected && (
+        <rect x={obj.x} y={obj.y} width={obj.w} height={obj.h} fill="none" stroke="#3b82f6" strokeWidth={1.5} strokeDasharray="4,2" />
+      )}
+    </svg>
+  );
+}
+
+// ── WordArtPanel ──────────────────────────────────────────────────────────────
+
+function WordArtPanel({ obj, onUpdate, onBgImageUpload }: {
+  obj: WordArtObj;
+  onUpdate: (patch: Partial<WordArtObj>) => void;
+  onBgImageUpload: (cb: (url: string) => void) => void;
+}) {
+  const [textFillMode, setTextFillMode] = useState<"solid" | "gradient">(obj.textGradient ? "gradient" : "solid");
+  const [bgMode, setBgMode]             = useState<WordArtBg["type"]>(obj.bg.type);
+
+  const sec: React.CSSProperties = { padding: "8px 12px", borderBottom: "1px solid #1e293b" };
+  const lbl: React.CSSProperties = { fontSize: 10, color: "#64748b", fontFamily: "Bangers, cursive", letterSpacing: 1, textTransform: "uppercase", display: "block", marginBottom: 6 };
+  const tab = (on: boolean): React.CSSProperties => ({
+    flex: 1, padding: "3px 0", borderRadius: 4, fontSize: 11, cursor: "pointer",
+    background: on ? "#3b82f6" : "#0f172a",
+    border: "1px solid " + (on ? "#3b82f6" : "#334155"),
+    color: on ? "#fff" : "#64748b",
+  });
+
+  return (
+    <div style={{ overflowY: "auto", flex: 1 }}>
+
+      {/* Content */}
+      <div style={sec}>
+        <span style={lbl}>Content</span>
+        <input
+          value={obj.content}
+          onChange={e => onUpdate({ content: e.target.value })}
+          style={{ width: "100%", background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: "5px 8px", fontSize: 14, outline: "none", boxSizing: "border-box", fontFamily: obj.fontFamily }}
+        />
+      </div>
+
+      {/* Font */}
+      <div style={sec}>
+        <span style={lbl}>Font</span>
+        <select
+          value={obj.fontFamily}
+          onChange={e => onUpdate({ fontFamily: e.target.value })}
+          style={{ width: "100%", background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: "4px 6px", fontSize: 12, cursor: "pointer", boxSizing: "border-box" }}
+        >
+          {FONTS.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
+        </select>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 7 }}>
+          <span style={{ fontSize: 11, color: "#94a3b8", flexShrink: 0 }}>Size</span>
+          <input
+            type="number" min={12} max={200} value={obj.fontSize}
+            onChange={e => onUpdate({ fontSize: Math.max(12, Math.min(200, Number(e.target.value))) })}
+            style={{ flex: 1, background: "#0f172a", border: "1px solid #334155", color: "#e2e8f0", borderRadius: 4, padding: "3px 6px", fontSize: 12, outline: "none" }}
+          />
+          <span style={{ fontSize: 11, color: "#64748b" }}>px</span>
+        </div>
+      </div>
+
+      {/* Text fill */}
+      <div style={sec}>
+        <span style={lbl}>Text fill</span>
+        <div style={{ display: "flex", gap: 4, marginBottom: 8 }}>
+          <button style={tab(textFillMode === "solid")} onClick={() => { setTextFillMode("solid"); onUpdate({ textGradient: null }); }}>Solid</button>
+          <button style={tab(textFillMode === "gradient")} onClick={() => {
+            setTextFillMode("gradient");
+            if (!obj.textGradient) onUpdate({ textGradient: { stops: [{ color: "#ff0000", pos: 0 }, { color: "#0088ff", pos: 1 }], angle: 0 } });
+          }}>Gradient</button>
+        </div>
+        {textFillMode === "solid" && (
+          <ColorPicker value={obj.textColor} onChange={color => onUpdate({ textColor: color })} />
+        )}
+        {textFillMode === "gradient" && obj.textGradient && (
+          <GradientEditor gradient={obj.textGradient} onChange={g => onUpdate({ textGradient: g })} />
+        )}
+      </div>
+
+      {/* Background */}
+      <div style={sec}>
+        <span style={lbl}>Background</span>
+        <div style={{ display: "flex", gap: 3, flexWrap: "wrap", marginBottom: 8 }}>
+          {(["none", "solid", "gradient", "image"] as const).map(t => (
+            <button key={t} style={{ ...tab(bgMode === t), flex: "none", padding: "3px 7px" }} onClick={() => {
+              setBgMode(t);
+              if (t === "none")     onUpdate({ bg: { type: "none" } });
+              if (t === "solid")    onUpdate({ bg: { type: "solid", color: obj.bg.type === "solid" ? obj.bg.color : "#ffffff" } });
+              if (t === "gradient") onUpdate({ bg: { type: "gradient", stops: [{ color: "#ff6b6b", pos: 0 }, { color: "#4ecdc4", pos: 1 }], angle: 90 } });
+              if (t === "image")    onBgImageUpload(url => onUpdate({ bg: { type: "image", url } }));
+            }}>
+              {t === "none" ? "None" : t === "solid" ? "Color" : t === "gradient" ? "Grad" : "Image"}
+            </button>
+          ))}
+        </div>
+        {bgMode === "solid" && obj.bg.type === "solid" && (
+          <ColorPicker value={obj.bg.color} onChange={color => onUpdate({ bg: { type: "solid", color } })} />
+        )}
+        {bgMode === "gradient" && obj.bg.type === "gradient" && (
+          <GradientEditor
+            gradient={{ stops: (obj.bg as GradientDef & { type: string }).stops, angle: (obj.bg as GradientDef & { type: string }).angle }}
+            onChange={g => onUpdate({ bg: { type: "gradient", ...g } })}
+          />
+        )}
+        {bgMode === "image" && obj.bg.type === "image" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <img src={obj.bg.url} alt="" style={{ width: "100%", height: 55, objectFit: "cover", borderRadius: 4, border: "1px solid #334155" }} />
+            <button onClick={() => onBgImageUpload(url => onUpdate({ bg: { type: "image", url } }))} style={{ ...btnStyle("#1e293b"), border: "1px dashed #475569", fontSize: 11 }}>
+              ⬆ Replace image
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Curve */}
+      <div style={sec}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <span style={lbl}>Curve</span>
+          <span style={{ fontSize: 11, color: "#94a3b8", marginBottom: 6 }}>{obj.curve > 0 ? "+" : ""}{obj.curve}</span>
+        </div>
+        <input type="range" min={-100} max={100} value={obj.curve}
+          onChange={e => onUpdate({ curve: Number(e.target.value) })}
+          style={{ width: "100%" }} />
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2 }}>
+          <span style={{ fontSize: 10, color: "#475569" }}>↓ arch</span>
+          <span style={{ fontSize: 10, color: "#475569" }}>arch ↑</span>
+        </div>
+      </div>
+
+      {/* Outline */}
+      <div style={sec}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <span style={lbl}>Outline</span>
+          <input type="checkbox" checked={obj.outline !== null}
+            onChange={e => onUpdate({ outline: e.target.checked ? { color: "#000000", width: 3 } : null })} />
+        </div>
+        {obj.outline && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <ColorPicker value={obj.outline.color} onChange={color => onUpdate({ outline: { ...obj.outline!, color } })} />
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ fontSize: 11, color: "#94a3b8", width: 32, flexShrink: 0 }}>Width</span>
+              <input type="range" min={1} max={24} value={obj.outline.width}
+                onChange={e => onUpdate({ outline: { ...obj.outline!, width: Number(e.target.value) } })}
+                style={{ flex: 1 }} />
+              <span style={{ fontSize: 11, color: "#64748b", width: 20, textAlign: "right" }}>{obj.outline.width}</span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Shadow */}
+      <div style={sec}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+          <span style={lbl}>Shadow</span>
+          <input type="checkbox" checked={obj.shadow !== null}
+            onChange={e => onUpdate({ shadow: e.target.checked ? { color: "#000000", blur: 8, dx: 4, dy: 4 } : null })} />
+        </div>
+        {obj.shadow && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <ColorPicker value={obj.shadow.color} onChange={color => onUpdate({ shadow: { ...obj.shadow!, color } })} />
+            {[
+              ["Blur", "blur", 0, 40] as const,
+              ["X",    "dx",   -30, 30] as const,
+              ["Y",    "dy",   -30, 30] as const,
+            ].map(([label, key, min, max]) => (
+              <div key={key} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 11, color: "#94a3b8", width: 28, flexShrink: 0 }}>{label}</span>
+                <input type="range" min={min} max={max} value={obj.shadow![key as keyof typeof obj.shadow] as number}
+                  onChange={e => onUpdate({ shadow: { ...obj.shadow!, [key]: Number(e.target.value) } })}
+                  style={{ flex: 1 }} />
+                <span style={{ fontSize: 11, color: "#64748b", width: 22, textAlign: "right" }}>{obj.shadow![key as keyof typeof obj.shadow]}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+    </div>
+  );
 }

@@ -8,6 +8,15 @@
 
 # testing
 /coverage
+/test-results
+/tests/.auth
+
+# database
+prisma/dev.db
+prisma/dev.db-journal
+
+# partykit local state
+.partykit/state/
 
 # next.js
 /.next/
